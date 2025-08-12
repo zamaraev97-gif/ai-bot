@@ -1,4 +1,5 @@
-import os, base64, urllib.request
+import os, base64
+from io import BytesIO
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
@@ -24,7 +25,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = OpenAI(api_key=api_key, base_url=base_url)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     user_text = (update.message.text or "").strip()
-    resp = client.chat.completions.create(
+    resp = client.chat_completions.create(   # SDK совместим и с .chat.completions.create
         model=text_model,
         messages=[{"role":"system","content":system},
                   {"role":"user","content":user_text}],
@@ -37,25 +38,28 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     client = OpenAI(api_key=api_key, base_url=base_url)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_PHOTO)
 
-    # 1) берём самый большой вариант фото
+    # 1) Берём самый большой вариант фото и скачиваем БАЙТЫ через Bot API (без внешнего URL)
     photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    tg_file_url = f"https://api.telegram.org/file/bot{tg_token}/{file.file_path}"
+    tg_file = await context.bot.get_file(photo.file_id)
 
-    # 2) скачиваем байты и превращаем в data URL (base64)
+    # способ 1: в память (PTB v22+)
     try:
-        data = urllib.request.urlopen(tg_file_url, timeout=20).read()
-    except Exception as e:
-        await update.message.reply_text(f"Не смог скачать фото: {e}")
-        return
+        raw: bytearray = await tg_file.download_as_bytearray()
+        data_bytes = bytes(raw)
+    except Exception:
+        # запасной путь — в BytesIO (на случай другой версии PTB)
+        buf = BytesIO()
+        await tg_file.download_to_memory(out=buf)
+        data_bytes = buf.getvalue()
 
-    b64 = base64.b64encode(data).decode("utf-8")
+    # 2) Кодируем в base64 и формируем data URL (Telegram photo обычно JPEG)
+    b64 = base64.b64encode(data_bytes).decode("utf-8")
     data_url = f"data:image/jpeg;base64,{b64}"
     caption = update.message.caption or "Опиши изображение"
 
-    # 3) отправляем в Groq как image_url с data: схемой
+    # 3) Отправляем в Groq vision
     try:
-        resp = client.chat.completions.create(
+        resp = client.chat_completions.create(
             model=vision_model,
             messages=[
                 {"role":"system","content":system},
