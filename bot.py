@@ -109,7 +109,7 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
             model="gpt-image-1",
             prompt=prompt,
             size=size,
-            quality="standard"
+            quality="high"
         )
         b64 = images.data[0].b64_json
         img_bytes = base64.b64decode(b64)
