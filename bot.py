@@ -1,17 +1,16 @@
-import os, base64, traceback, json
+import os, base64, traceback
 from io import BytesIO
-import requests
+import replicate
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from openai import OpenAI, BadRequestError, APIConnectionError, APIStatusError, NotFoundError
+from openai import OpenAI
 
 load_dotenv()
 
-# --- LLM через Groq (совместимый OpenAI endpoint) ---
+# --- LLM (текст/визуал) остаётся через Groq ---
 VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-
 def _llm_cfg():
     return (
         os.getenv("TELEGRAM_BOT_TOKEN"),
@@ -21,59 +20,20 @@ def _llm_cfg():
         os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
     )
 
-# --- Images: приоритет Stability → затем OpenAI ---
-STABILITY_URL = "https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image"
-
-def _img_size(sz: str) -> tuple[int,int]:
-    sz = (sz or "").lower()
-    if "512" in sz:  return 512, 512
-    if "768" in sz:  return 768, 768
-    return 1024, 1024
-
-def _gen_via_stability(prompt: str, size: str|None) -> bytes:
-    api_key = os.getenv("STABILITY_API_KEY")
-    if not api_key:
-        raise RuntimeError("STABILITY_API_KEY is not set")
-    w, h = _img_size(size)
-    payload = {
-        "text_prompts": [{"text": prompt}],
-        "cfg_scale": 7,
-        "height": h,
-        "width": w,
-        "samples": 1,
-        "steps": 30,
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    r = requests.post(STABILITY_URL, headers=headers, data=json.dumps(payload), timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Stability error {r.status_code}: {r.text}")
-    data = r.json()
-    if not data.get("artifacts"):
-        raise RuntimeError("Stability: empty artifacts")
-    b64 = data["artifacts"][0].get("base64")
-    if not b64:
-        raise RuntimeError("Stability: no base64 in response")
-    return base64.b64decode(b64)
-
-def _openai_images_generate(prompt: str, size: str|None) -> bytes:
-    key = os.getenv("OPENAI_IMAGES_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_IMAGES_API_KEY is not set")
-    size = size or "1024x1024"
-    client = OpenAI(api_key=key, base_url="https://api.openai.com/v1")
-    img = client.images.generate(model="gpt-image-1", prompt=prompt, size=size, quality="high")
-    b64 = img.data[0].b64_json
-    return base64.b64decode(b64)
+# --- вспомогалки ---
+def _parse_size(text: str) -> str:
+    # конвертируем --size в aspect_ratio для Replicate
+    # поддержим квадрат/горизонталь/вертикаль
+    s = (text or "").lower()
+    if "16:9" in s or " 169" in s: return "16:9"
+    if "9:16" in s or " 916" in s: return "9:16"
+    return "1:1"
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Команды:\n"
-        "/imagine <описание> [--size 512|768|1024] — сгенерировать изображение\n"
-        "Пришли фото с подписью — опишу картинку.\n"
+        "/imagine <описание> [--size 1:1|16:9|9:16] — сгенерировать изображение (Replicate, FLUX)\n"
+        "Пришли фото с подписью — опишу картинку (vision).\n"
     )
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -88,6 +48,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(resp.choices[0].message.content.strip())
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Анализ фото остаётся как раньше (через Groq vision)
+    from io import BytesIO
+    import base64
     tg, base, key, text_model, system = _llm_cfg()
     client = OpenAI(api_key=key, base_url=base)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
@@ -119,21 +82,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(resp.choices[0].message.content.strip())
 
-def _parse_size_flag(text: str) -> tuple[str,str]:
-    size = None
-    prompt = text
-    if "--size" in text:
-        try:
-            before, after = text.split("--size", 1)
-            prompt = before.strip()
-            size_token = after.strip().split()[0]
-            if "512" in size_token: size = "512x512"
-            elif "768" in size_token: size = "768x768"
-            else: size = "1024x1024"
-        except Exception:
-            pass
-    return prompt.strip(), size
-
 async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # мгновенный отклик
     notice = await update.message.reply_text("Генерирую изображение… ⏳")
@@ -142,40 +90,48 @@ async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parts = full.split(" ", 1)
         prompt = parts[1].strip() if len(parts) > 1 else ""
         if not prompt:
-            await notice.edit_text("Напиши: /imagine рыжий кот на луне [--size 512|768|1024]")
+            await notice.edit_text("Напиши: /imagine рыжий кот на луне [--size 1:1|16:9|9:16]")
             return
-        prompt, size = _parse_size_flag(prompt)
+
+        # size → aspect_ratio
+        aspect_ratio = "1:1"
+        if "--size" in prompt:
+            try:
+                before, after = prompt.split("--size", 1)
+                prompt = before.strip()
+                aspect_ratio = _parse_size(after)
+            except Exception:
+                pass
+
+        # Replicate (FLUX.1 schnell). Для офиц. моделей можно вызывать по `{owner}/{name}`.
+        # https://replicate.com/black-forest-labs/flux-schnell/api
+        token = os.getenv("REPLICATE_API_TOKEN")
+        if not token:
+            await notice.edit_text("Нет REPLICATE_API_TOKEN в переменных окружения Render.")
+            return
+        rep_client = replicate.Client(api_token=token)
 
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
-
-        img_bytes: bytes|None = None
-        err_msgs = []
-
-        # 1) Пытаемся через Stability (если есть ключ)
-        if os.getenv("STABILITY_API_KEY"):
-            try:
-                img_bytes = _gen_via_stability(prompt, size)
-            except Exception as e:
-                err_msgs.append(f"Stability: {e}")
-
-        # 2) Если не вышло — пробуем OpenAI (если есть ключ)
-        if img_bytes is None and os.getenv("OPENAI_IMAGES_API_KEY"):
-            try:
-                img_bytes = _openai_images_generate(prompt, size)
-            except Exception as e:
-                err_msgs.append(f"OpenAI Images: {e}")
-
-        if img_bytes is None:
-            msg = "Не удалось сгенерировать изображение."
-            if not os.getenv("STABILITY_API_KEY") and not os.getenv("OPENAI_IMAGES_API_KEY"):
-                msg += "\nНет ключей: добавь STABILITY_API_KEY или OPENAI_IMAGES_API_KEY."
-            else:
-                msg += "\n" + "\n".join(err_msgs[:2])
-            await notice.edit_text(msg)
+        outputs = rep_client.run(
+            "black-forest-labs/flux-schnell",  # офиц. модель, версия не нужна  [oai_citation:1‡replicate.com](https://replicate.com/changelog/2025-08-05-run-all-models-with-the-same-api-endpoint?utm_source=chatgpt.com)
+            input={
+                "prompt": prompt,
+                "aspect_ratio": aspect_ratio,
+                "num_outputs": 1
+            }
+        )
+        # outputs — список FileOutput или URL. Возьмём первый и пошлём как фото.
+        out = outputs[0]
+        if hasattr(out, "read"):  # FileOutput
+            data = out.read()
+        else:
+            # URL — скачивать не будем, просто пришлём как фото по URL
+            await notice.delete()
+            await update.message.reply_photo(photo=str(out), caption="Готово ✅")
             return
 
         await notice.delete()
-        await update.message.reply_photo(photo=BytesIO(img_bytes), caption="Готово ✅")
+        await update.message.reply_photo(photo=BytesIO(data), caption=f"Готово ✅ ({aspect_ratio})")
 
     except Exception as e:
         tb = traceback.format_exc(limit=2)
