@@ -8,3 +8,4 @@ python-docx==1.1.*
 pandas==2.*
 numpy==1.*
 uvloop==0.20.*
+requests==2.*
