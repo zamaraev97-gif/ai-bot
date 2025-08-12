@@ -9,3 +9,5 @@ pandas==2.*
 numpy==1.*
 uvloop==0.20.*
 requests==2.*
+
+replicate==0.27.*
