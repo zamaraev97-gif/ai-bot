@@ -19,12 +19,12 @@ def _llm_cfg():
         os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
     )
 
-# OpenAI Images (генерация)
+# OpenAI Images (генерация) — ИМЕННО api.openai.com
 def _img_client():
     key = os.getenv("OPENAI_IMAGES_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_IMAGES_API_KEY is not set")
-    return OpenAI(api_key=key)  # api.openai.com
+    return OpenAI(api_key=key, base_url="https://api.openai.com/v1")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -85,7 +85,6 @@ def _parse_size(s: str) -> str:
 
 async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # мгновенный отклик, чтобы ты видел, что команда поймалась
         msg = await update.message.reply_text("Генерирую изображение… ⏳")
 
         full = (update.message.text or "").strip()
