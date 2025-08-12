@@ -1,58 +1,103 @@
-import os
-import requests
+import os, traceback
+from io import BytesIO
+import replicate
+from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ChatAction
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from openai import OpenAI
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+load_dotenv()
+
+# --- текстовый LLM через Groq (OpenAI-совместимый) ---
+TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+BASE_URL   = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
+API_KEY    = os.getenv("OPENAI_API_KEY")
+TEXT_MODEL = os.getenv("OPENAI_MODEL", "llama-3.3-70b-versatile")
+SYSTEM     = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
+
+# --- Replicate для /imagine ---
 REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 
-# Обработчик команды /start
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Отправь мне текст, и я сгенерирую изображение через Replicate.")
+def _parse_prompt_and_ratio(text: str):
+    prompt = text
+    ratio = "1:1"
+    if "--size" in text:
+        try:
+            before, after = text.split("--size", 1)
+            prompt = before.strip()
+            token = after.strip().split()[0].lower()
+            if token in ("1:1", "16:9", "9:16"):
+                ratio = token
+        except Exception:
+            pass
+    return prompt.strip(), ratio
 
-# Обработчик текстовых сообщений
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = update.message.text
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я умею:\n"
+        "• обычный текст — отвечаю как чат\n"
+        "• /imagine <описание> [--size 1:1|16:9|9:16] — сгенерировать изображение (Replicate)\n"
+    )
+
+# ======== ТЕКСТ ========
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        image_url = generate_image(prompt)
-        if image_url:
-            await update.message.reply_photo(photo=image_url)
-        else:
-            await update.message.reply_text("Не удалось сгенерировать изображение.")
+        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+        user_text = (update.message.text or "").strip()
+        resp = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[{"role":"system","content":SYSTEM},
+                      {"role":"user","content":user_text}],
+            temperature=0.5
+        )
+        await update.message.reply_text(resp.choices[0].message.content.strip())
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+        tb = traceback.format_exc(limit=2)
+        await update.message.reply_text(f"Не удалось ответить: {e}\n{tb}")
 
-# Функция генерации через Replicate
-def generate_image(prompt):
-    url = "https://api.replicate.com/v1/predictions"
-    headers = {
-        "Authorization": f"Token {REPLICATE_API_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "version": "a16ba0b1f30ddf6ffb7e751063ba1fdfc8646e26e99b3a73a5800d34fecd4c3c", # stable-diffusion
-        "input": {
-            "prompt": prompt
-        }
-    }
-    response = requests.post(url, headers=headers, json=data)
-    response.raise_for_status()
-    prediction = response.json()
+# ======== ИЗОБРАЖЕНИЯ ========
+async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    notice = await update.message.reply_text("Генерирую изображение… ⏳")
+    try:
+        if not REPLICATE_API_TOKEN:
+            await notice.edit_text("Нет REPLICATE_API_TOKEN в переменных окружения Render.")
+            return
+        text = (update.message.text or "").strip()
+        parts = text.split(" ", 1)
+        if len(parts) < 2 or not parts[1].strip():
+            await notice.edit_text("Формат: /imagine кот в очках --size 1:1")
+            return
 
-    # Ждём, пока модель завершит работу
-    status = prediction["status"]
-    while status != "succeeded" and status != "failed":
-        r = requests.get(f"https://api.replicate.com/v1/predictions/{prediction['id']}", headers=headers)
-        r.raise_for_status()
-        prediction = r.json()
-        status = prediction["status"]
+        prompt, ratio = _parse_prompt_and_ratio(parts[1])
+        await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
 
-    if status == "succeeded":
-        return prediction["output"][0]
-    return None
+        client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+        # официальная модель по имени — без version
+        output = client.run(
+            "black-forest-labs/flux-schnell",
+            input={"prompt": prompt, "aspect_ratio": ratio, "num_outputs": 1}
+        )
+        if not output:
+            await notice.edit_text("Пустой ответ от модели.")
+            return
+
+        await notice.delete()
+        await update.message.reply_photo(photo=str(output[0]), caption=f"Готово ✅ ({ratio})")
+
+    except Exception as e:
+        tb = traceback.format_exc(limit=2)
+        try:
+            await notice.edit_text(f"Ошибка: {e}\n{tb}")
+        except Exception:
+            await update.message.reply_text(f"Ошибка: {e}\n{tb}")
 
 def build_application():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    if not TG_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
+    app = ApplicationBuilder().token(TG_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("imagine", cmd_imagine))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
