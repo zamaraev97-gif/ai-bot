@@ -1,6 +1,5 @@
-import os, traceback
+import os, base64
 from io import BytesIO
-import replicate
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ChatAction
@@ -9,41 +8,24 @@ from openai import OpenAI
 
 load_dotenv()
 
-# --- текстовый LLM через Groq (OpenAI-совместимый) ---
+# Конфиг LLM (Groq совместимый OpenAI API)
 TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 BASE_URL   = os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
 API_KEY    = os.getenv("OPENAI_API_KEY")
 TEXT_MODEL = os.getenv("OPENAI_MODEL", "llama-3.3-70b-versatile")
+VISION_MODEL = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 SYSTEM     = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
 
-# --- Replicate для /imagine ---
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-
-def _parse_prompt_and_ratio(text: str):
-    prompt = text
-    ratio = "1:1"
-    if "--size" in text:
-        try:
-            before, after = text.split("--size", 1)
-            prompt = before.strip()
-            token = after.strip().split()[0].lower()
-            if token in ("1:1", "16:9", "9:16"):
-                ratio = token
-        except Exception:
-            pass
-    return prompt.strip(), ratio
+def _client():
+    return OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я умею:\n"
-        "• обычный текст — отвечаю как чат\n"
-        "• /imagine <описание> [--size 1:1|16:9|9:16] — сгенерировать изображение (Replicate)\n"
-    )
+    await update.message.reply_text("Привет! Пиши текст — отвечу. Пришли фото с подписью — опишу картинку.")
 
-# ======== ТЕКСТ ========
+# Текст → ответ модели
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+        client = _client()
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
         user_text = (update.message.text or "").strip()
         resp = client.chat.completions.create(
@@ -54,50 +36,49 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await update.message.reply_text(resp.choices[0].message.content.strip())
     except Exception as e:
-        tb = traceback.format_exc(limit=2)
-        await update.message.reply_text(f"Не удалось ответить: {e}\n{tb}")
+        await update.message.reply_text(f"Не удалось ответить: {e}")
 
-# ======== ИЗОБРАЖЕНИЯ ========
-async def cmd_imagine(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    notice = await update.message.reply_text("Генерирую изображение… ⏳")
+# Фото → описание (vision)
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not REPLICATE_API_TOKEN:
-            await notice.edit_text("Нет REPLICATE_API_TOKEN в переменных окружения Render.")
-            return
-        text = (update.message.text or "").strip()
-        parts = text.split(" ", 1)
-        if len(parts) < 2 or not parts[1].strip():
-            await notice.edit_text("Формат: /imagine кот в очках --size 1:1")
-            return
-
-        prompt, ratio = _parse_prompt_and_ratio(parts[1])
+        client = _client()
         await context.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
 
-        client = replicate.Client(api_token=REPLICATE_API_TOKEN)
-        # официальная модель по имени — без version
-        output = client.run(
-            "black-forest-labs/flux-schnell",
-            input={"prompt": prompt, "aspect_ratio": ratio, "num_outputs": 1}
-        )
-        if not output:
-            await notice.edit_text("Пустой ответ от модели.")
-            return
-
-        await notice.delete()
-        await update.message.reply_photo(photo=str(output[0]), caption=f"Готово ✅ ({ratio})")
-
-    except Exception as e:
-        tb = traceback.format_exc(limit=2)
+        # берём максимальный размер фото и качаем БАЙТЫ через Bot API (без внешних URL)
+        photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(photo.file_id)
         try:
-            await notice.edit_text(f"Ошибка: {e}\n{tb}")
+            raw: bytearray = await tg_file.download_as_bytearray()
+            data_bytes = bytes(raw)
         except Exception:
-            await update.message.reply_text(f"Ошибка: {e}\n{tb}")
+            buf = BytesIO()
+            await tg_file.download_to_memory(out=buf)
+            data_bytes = buf.getvalue()
+
+        b64 = base64.b64encode(data_bytes).decode("utf-8")
+        data_url = f"data:image/jpeg;base64,{b64}"
+        caption = update.message.caption or "Опиши изображение"
+
+        resp = client.chat.completions.create(
+            model=VISION_MODEL,
+            messages=[
+                {"role":"system","content":SYSTEM},
+                {"role":"user","content":[
+                    {"type":"text","text":caption},
+                    {"type":"image_url","image_url":{"url":data_url}}
+                ]}
+            ],
+            temperature=0.2
+        )
+        await update.message.reply_text(resp.choices[0].message.content.strip())
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка анализа изображения: {e}")
 
 def build_application():
     if not TG_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
     app = ApplicationBuilder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("imagine", cmd_imagine))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
