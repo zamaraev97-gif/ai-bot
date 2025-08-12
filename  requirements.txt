@@ -1,0 +1,10 @@
+python-telegram-bot==22.3
+fastapi==0.111.*
+uvicorn==0.30.*
+openai==1.*
+python-dotenv==1.*
+pypdf==4.*
+python-docx==1.1.*
+pandas==2.*
+numpy==1.*
+uvloop==0.20.*
