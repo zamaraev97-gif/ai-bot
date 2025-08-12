@@ -1,0 +1,43 @@
+# server.py — FastAPI + Telegram webhook + /set_webhook
+import os, asyncio
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request, Response
+from http import HTTPStatus
+from telegram import Update
+from bot import build_application
+
+load_dotenv()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
+WEBHOOK_PATH    = os.getenv("WEBHOOK_PATH", "/webhook")
+
+app = FastAPI()  # <— ВАЖНО: объект называется app
+
+ptb_app = build_application()
+asyncio.get_event_loop().create_task(ptb_app.initialize())
+asyncio.get_event_loop().create_task(ptb_app.start())
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await ptb_app.stop()
+    await ptb_app.shutdown()
+
+@app.get("/")
+async def root():
+    return {"ok": True}
+
+@app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, ptb_app.bot)
+    await ptb_app.update_queue.put(update)
+    return Response(status_code=HTTPStatus.OK)
+
+@app.post("/set_webhook")
+async def set_webhook():
+    url = PUBLIC_BASE_URL.rstrip("/") + WEBHOOK_PATH
+    ok = await ptb_app.bot.set_webhook(url)
+    return {"ok": ok, "url": url}git add server.py bot.py
+git commit -m "add FastAPI app and minimal bot"
+git push
+cd ~/Desktop/"ai bot"
+

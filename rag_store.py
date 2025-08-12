@@ -23,12 +23,7 @@ class RagStore:
     def add_chunks(self, source_id: str, chunks: List[str], embeddings: List[List[float]]):
         with open(self.index_path, "a", encoding="utf-8") as f:
             for text, emb in zip(chunks, embeddings):
-                rec = {
-                    "id": str(uuid.uuid4()),
-                    "source_id": source_id,
-                    "text": text,
-                    "embedding": emb,
-                }
+                rec = {"id": str(uuid.uuid4()), "source_id": source_id, "text": text, "embedding": emb}
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def search(self, query_embedding: List[float], k: int = 5) -> List[Dict]:
