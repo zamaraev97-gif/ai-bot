@@ -733,3 +733,138 @@ def build_application():
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
+
+# --- robust size parser (sizes/ratio/keywords RU+EN) ---
+import re as _re
+def _parse_size_flag(text: str, default: str = "1024x1024"):
+    """
+    Возвращает (prompt, size).
+    Понимает:
+      • --size 1024x1792 | size=16:9 | размер 9:16 | 1024 x 1024 | 1024
+      • слова: квадрат/square, портрет/vertical/portrait, альбом/landscape/горизонт
+    Подбирает допустимый размер под текущую модель генерации.
+    """
+    raw = text or ""
+    low = raw.lower()
+
+    # Допустимые размеры по модели
+    primary = (os.getenv("OPENAI_IMAGE_PRIMARY") or "dall-e-3").lower().strip()
+    if primary == "dall-e-3":
+        allowed = {"1024x1024", "1024x1792", "1792x1024"}
+        tall, wide, square = "1024x1792", "1792x1024", "1024x1024"
+    else:
+        # gpt-image-1 (или что-то ещё) — подберём ближайшее
+        allowed = {"1024x1024", "1024x1536", "1536x1024", "auto"}
+        tall, wide, square = "1024x1536", "1536x1024", "1024x1024"
+
+    def clamp_allowed(sz: str) -> str:
+        sz = sz.lower().replace(" ", "")
+        # Нормализация 1024×1536 и т.п.
+        sz = sz.replace("×", "x").replace("*", "x")
+        if sz in allowed:
+            return sz
+        # Пытаемся понять ориентацию/соотношение
+        m = _re.match(r"^(\d+)\s*x\s*(\d+)$", sz)
+        if m:
+            w, h = int(m.group(1)), int(m.group(2))
+            if w == h:   return square
+            if h > w:    return tall
+            return wide
+        # ratio a:b
+        m = _re.match(r"^(\d+)\s*:\s*(\d+)$", sz)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a == b:   return square
+            if b > a:    return tall
+            return wide
+        # одно число — считаем квадрат
+        m = _re.match(r"^\d{3,4}$", sz)
+        if m:
+            return square
+        return default if default in allowed else square
+
+    # 1) Явные директивы: --size … | size=… | размер …
+    found_snippets = []
+    patterns = [
+        r"--size\s*([0-9x×:* ]+)",
+        r"\bsize\s*[=:]\s*([0-9x×:* ]+)",
+        r"\bразмер\s*[=:]?\s*([0-9x×:* ]+)",
+        r"\bratio\s*[=:]\s*([0-9: ]+)",
+        r"\bсоотношение\s*[=:]?\s*([0-9: ]+)",
+    ]
+    desired = None
+    for p in patterns:
+        m = _re.search(p, low)
+        if m:
+            desired = m.group(1).strip()
+            # сохраним весь фрагмент для вырезания из промпта
+            span = m.span()
+            found_snippets.append(raw[span[0]:span[1]])
+            break
+
+    # 2) Если не нашли директив, ищем свободные формы: 1024x1792 / 16:9 / 1024 x 1024
+    if not desired:
+        m = _re.search(r"\b(\d{3,4})\s*[x×*]\s*(\d{3,4})\b", low)
+        if m:
+            desired = f"{m.group(1)}x{m.group(2)}"
+            found_snippets.append(m.group(0))
+    if not desired:
+        m = _re.search(r"\b(\d{1,2})\s*:\s*(\d{1,2})\b", low)
+        if m:
+            desired = f"{m.group(1)}:{m.group(2)}"
+            found_snippets.append(m.group(0))
+    if not desired:
+        # одно число 512 / 768 / 1024
+        m = _re.search(r"\b(512|768|1024|1536|1792)\b", low)
+        if m:
+            desired = m.group(1)
+            found_snippets.append(m.group(0))
+
+    # 3) Ключевые слова ориентации
+    if not desired:
+        # рус/англ
+        if any(k in low for k in ["портрет", "вертик"] + ["portrait", "vertical"]):
+            desired = "portrait"
+        elif any(k in low for k in ["альбом", "горизонт"] + ["landscape", "horizontal"]):
+            desired = "landscape"
+        elif any(k in low for k in ["квадрат", "square"]):
+            desired = "square"
+
+    # 4) Нормализация желаемого и выбор допустимого
+    chosen = None
+    if desired:
+        d = desired.lower().strip()
+        d = d.replace("×", "x").replace("*", "x")
+        if d in ("portrait", "vertical"):
+            chosen = tall
+        elif d in ("landscape", "horizontal"):
+            chosen = wide
+        elif d in ("square", "квадрат"):
+            chosen = square
+        elif _re.match(r"^\d+\s*:\s*\d+$", d):
+            chosen = clamp_allowed(d)
+        elif _re.match(r"^\d{3,4}\s*x\s*\d{3,4}$", d):
+            chosen = clamp_allowed(d)
+        elif _re.match(r"^\d{3,4}$", d):
+            chosen = clamp_allowed(d)
+        else:
+            chosen = default if default in allowed else square
+    else:
+        chosen = default if default in allowed else square
+
+    # 5) Чистим промпт от директив и ключевых слов (аккуратно)
+    cleaned = raw
+    for snip in found_snippets:
+        cleaned = cleaned.replace(snip, "")
+    # удалим возможные маркеры без значений
+    cleaned = _re.sub(r"--size\s*[0-9x×:* ]*", "", cleaned, flags=_re.IGNORECASE)
+    cleaned = _re.sub(r"\b(size|размер|ratio|соотношение)\s*[=:]?\s*[0-9x×:* ]*", "", cleaned, flags=_re.IGNORECASE)
+    # уберём одиночные слова-режимы, если они шли как маркеры
+    cleaned = _re.sub(r"\b(портрет(ная)?|вертик(альный|альная)?|portrait|vertical)\b", "", cleaned, flags=_re.IGNORECASE)
+    cleaned = _re.sub(r"\b(альбом(ная)?|горизонт(альный|альная)?|landscape|horizontal)\b", "", cleaned, flags=_re.IGNORECASE)
+    cleaned = _re.sub(r"\b(квадрат(ный)?|square)\b", "", cleaned, flags=_re.IGNORECASE)
+
+    cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip()
+
+    return cleaned or raw.strip(), chosen
+# --- end robust size parser ---
