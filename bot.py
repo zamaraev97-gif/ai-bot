@@ -1,11 +1,11 @@
-import os, re, base64, sqlite3, time, traceback
+import os, base64, sqlite3, time, traceback
 from io import BytesIO
 from typing import List, Tuple
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ChatAction
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
-from openai import OpenAI, BadRequestError, APIStatusError
+from openai import OpenAI, BadRequestError, APIStatusError, PermissionDeniedError
 
 load_dotenv()
 
@@ -15,7 +15,7 @@ API_KEY    = os.getenv("OPENAI_API_KEY")          # sk-...
 BASE_URL   = "https://api.openai.com/v1"          # фиксируем OpenAI
 SYSTEM     = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
 
-# Приоритеты моделей (можно переопределить через ENV)
+# Приоритеты моделей (можно переопределить через ENV, имена моделей пользователю не показываем)
 TEXT_PREFS   = [m.strip() for m in os.getenv(
     "OPENAI_TEXT_PREFS",   "gpt-5,gpt-5-mini,gpt-4o,gpt-4.1-mini"
 ).split(",") if m.strip()]
@@ -24,9 +24,11 @@ VISION_PREFS = [m.strip() for m in os.getenv(
     "OPENAI_VISION_PREFS", "gpt-5,gpt-4o,gpt-4.1,gpt-5-mini"
 ).split(",") if m.strip()]
 
-IMAGE_MODEL  = os.getenv("OPENAI_IMAGE_MODEL", "dall-e-3")  # или gpt-image-1
+# Генерация изображений: сначала DALL·E 3 (не требует верификации), затем gpt-image-1 (если появится доступ)
+IMAGE_PRIMARY   = os.getenv("OPENAI_IMAGE_PRIMARY", "dall-e-3")
+IMAGE_FALLBACK  = os.getenv("OPENAI_IMAGE_FALLBACK", "gpt-image-1")
 
-# === SQLite: сообщения + выбор режима ===
+# === SQLite: история + выбранный режим на чат ===
 DB_PATH = os.getenv("STATE_DB_PATH", "state.db")
 
 def _db():
@@ -89,7 +91,7 @@ KB = ReplyKeyboardMarkup([[KeyboardButton(BTN_CHAT), KeyboardButton(BTN_IMG)]],
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = get_mode(update.effective_chat.id)
     await update.message.reply_text(
-        f"Привет! Выбери режим на клавиатуре ниже.\nТекущий режим: **{('болталка' if mode=='chat' else 'генерация фото')}**",
+        f"Привет! Выбери режим на клавиатуре ниже.\nТекущий режим: {('болталка' if mode=='chat' else 'генерация фото')}",
         reply_markup=KB
     )
 
@@ -99,6 +101,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # === Хелперы ===
 def _parse_size_flag(text: str, default: str = "1024x1024"):
+    """
+    Для DALL·E 3 допустимы: 1024x1024, 1024x1792, 1792x1024
+    Для gpt-image-1 допустимы также квадраты 512/768/1024.
+    """
     prompt = text
     size = default
     if "--size" in text:
@@ -112,23 +118,23 @@ def _parse_size_flag(text: str, default: str = "1024x1024"):
                 size = f"{token}x{token}"
         except Exception:
             pass
-    # DALL·E 3 поддерживает только эти три:
-    if IMAGE_MODEL == "dall-e-3" and size not in ("1024x1024","1024x1792","1792x1024"):
+    # DALL·E 3 — только три размера:
+    if IMAGE_PRIMARY == "dall-e-3" and size not in ("1024x1024","1024x1792","1792x1024"):
         size = "1024x1024"
     return prompt.strip(), size
 
-# === Логика режимов ===
+# === Обработка текстов c режимами ===
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     # Переключение режима по кнопке
     if text == BTN_CHAT:
         set_mode(update.effective_chat.id, "chat")
-        await update.message.reply_text("Режим: 💬 болталка", reply_markup=KB)
+        await update.message.reply_text("Режим: болталка", reply_markup=KB)
         return
     if text == BTN_IMG:
         set_mode(update.effective_chat.id, "image")
-        await update.message.reply_text("Режим: 🖼️ генерация фото\nНапиши описание, можно добавить --size 1024x1792", reply_markup=KB)
+        await update.message.reply_text("Режим: генерация фото\nНапиши описание, можно добавить --size 1024x1792", reply_markup=KB)
         return
 
     mode = get_mode(update.effective_chat.id)
@@ -148,7 +154,6 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_t
             messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": user_text})
 
-        errors = []
         for model in TEXT_PREFS:
             try:
                 resp = client.chat.completions.create(
@@ -159,13 +164,12 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_t
                 out = resp.choices[0].message.content.strip()
                 save_msg(update.effective_chat.id, "user", user_text)
                 save_msg(update.effective_chat.id, "assistant", out)
-                await update.message.reply_text(f"(model: {model})\n\n{out}", reply_markup=KB)
+                await update.message.reply_text(out, reply_markup=KB)  # без упоминания модели
                 return
-            except (BadRequestError, APIStatusError, Exception) as e:
-                errors.append(f"{model}: {e}")
+            except (BadRequestError, APIStatusError, Exception):
                 continue
 
-        await update.message.reply_text("Не удалось ответить ни одной моделью:\n" + "\n".join(errors[:3]), reply_markup=KB)
+        await update.message.reply_text("Не удалось ответить ни одной моделью.", reply_markup=KB)
     except Exception as e:
         tb = traceback.format_exc(limit=2)
         await update.message.reply_text(f"Не удалось ответить: {e}\n{tb}", reply_markup=KB)
@@ -177,23 +181,39 @@ async def handle_image_generation(update: Update, context: ContextTypes.DEFAULT_
 
         prompt, size = _parse_size_flag(text)
 
-        if IMAGE_MODEL == "dall-e-3":
-            gen = client.images.generate(model="dall-e-3", prompt=prompt, size=size)
-            # обычно возвращает URL
+        # 1) Пробуем DALL·E 3 (не требует верификации организации)
+        try:
+            gen = client.images.generate(model=IMAGE_PRIMARY, prompt=prompt, size=size)
             if hasattr(gen.data[0], "url") and gen.data[0].url:
                 await update.message.reply_photo(photo=gen.data[0].url, caption=f"Готово ✅ ({size})", reply_markup=KB)
                 return
             b64 = getattr(gen.data[0], "b64_json", None)
-        else:
-            gen = client.images.generate(model="gpt-image-1", prompt=prompt, size=size, quality="high")
-            b64 = gen.data[0].b64_json
+            if b64:
+                img_bytes = base64.b64decode(b64)
+                await update.message.reply_photo(photo=BytesIO(img_bytes), caption=f"Готово ✅ ({size})", reply_markup=KB)
+                return
+        except PermissionDeniedError:
+            # если вдруг и на DALL·E 3 нет прав — пойдём в fallback
+            pass
+        except BadRequestError:
+            # неверные параметры — попробуем fallback
+            pass
 
-        if not b64:
-            await update.message.reply_text("Не удалось получить картинку (пустой ответ).", reply_markup=KB)
-            return
+        # 2) Фоллбэк: gpt-image-1 (нужна верификация, но вдруг уже есть доступ)
+        try:
+            gen2 = client.images.generate(model=IMAGE_FALLBACK, prompt=prompt, size=size, quality="high")
+            b64 = getattr(gen2.data[0], "b64_json", None)
+            if b64:
+                img_bytes = base64.b64decode(b64)
+                await update.message.reply_photo(photo=BytesIO(img_bytes), caption=f"Готово ✅ ({size})", reply_markup=KB)
+                return
+            if hasattr(gen2.data[0], "url") and gen2.data[0].url:
+                await update.message.reply_photo(photo=gen2.data[0].url, caption=f"Готово ✅ ({size})", reply_markup=KB)
+                return
+        except (PermissionDeniedError, BadRequestError):
+            pass
 
-        img_bytes = base64.b64decode(b64)
-        await update.message.reply_photo(photo=BytesIO(img_bytes), caption=f"Готово ✅ ({size})", reply_markup=KB)
+        await update.message.reply_text("Не удалось получить картинку. Попробуй другой запрос или размер.", reply_markup=KB)
     except Exception as e:
         tb = traceback.format_exc(limit=2)
         await update.message.reply_text(f"Ошибка генерации: {e}\n{tb}", reply_markup=KB)
@@ -218,7 +238,6 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data_url = f"data:image/jpeg;base64,{b64}"
         caption = (update.message.caption or "Опиши изображение").strip()
 
-        errors = []
         for model in VISION_PREFS:
             try:
                 resp = client.chat.completions.create(
@@ -235,13 +254,12 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 out = resp.choices[0].message.content.strip()
                 save_msg(update.effective_chat.id, "user", f"[image] {caption}")
                 save_msg(update.effective_chat.id, "assistant", out)
-                await update.message.reply_text(f"(model: {model})\n\n{out}", reply_markup=KB)
+                await update.message.reply_text(out, reply_markup=KB)  # без упоминания модели
                 return
-            except (BadRequestError, APIStatusError, Exception) as e:
-                errors.append(f"{model}: {e}")
+            except (BadRequestError, APIStatusError, Exception):
                 continue
 
-        await update.message.reply_text("Не удалось проанализировать изображение:\n" + "\n".join(errors[:3]), reply_markup=KB)
+        await update.message.reply_text("Не удалось проанализировать изображение.", reply_markup=KB)
     except Exception as e:
         tb = traceback.format_exc(limit=2)
         await update.message.reply_text(f"Ошибка анализа изображения: {e}\n{tb}", reply_markup=KB)
