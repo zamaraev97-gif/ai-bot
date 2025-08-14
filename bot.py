@@ -263,11 +263,74 @@ async def handle_chat(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str
         except Exception:
             pass
 
+
 async def handle_image(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str):
-    chat_id=update.effective_chat.id
-    ok,warn,plan=allow_image(chat_id)
+    chat_id = update.effective_chat.id
+    ok, warn, plan = allow_image(chat_id)
     if not ok:
         await update.message.reply_text(warn, reply_markup=KB); return
+
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+    client = _client()
+    prompt = text.strip()
+
+    errors = []
+    img_b = None
+
+    # Явные параметры: 1024x1024, стандартное качество.
+    # Если в окружении есть OPENAI_IMAGE_PRIMARY — используем его в приоритете.
+    prefs = []
+    try:
+        from os import getenv
+        p = (getenv("OPENAI_IMAGE_PRIMARY","") or "").strip()
+        if p: prefs.append(p)
+    except Exception:
+        pass
+    from itertools import chain
+    prefs = list(dict.fromkeys(chain(prefs, IMAGE_PREFS)))  # уникальный порядок
+
+    for m in prefs:
+        try:
+            kwargs = {"model": m, "prompt": prompt, "size": "1024x1024"}
+            if (m or "").lower() == "dall-e-3":
+                kwargs["quality"] = "standard"
+            print(f"[IMG] try model={m} prompt={prompt[:80]!r}")
+            gen = client.images.generate(**kwargs)
+            b64 = gen.data[0].b64_json
+            img_b = base64.b64decode(b64)
+            print(f"[IMG] success model={m}")
+            break
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            print(f"[IMG-ERR] model={m} -> {msg}")
+            errors.append((m, msg))
+            continue
+
+    if not img_b:
+        human = "Не удалось сгенерировать изображение."
+        if errors:
+            _m, _e = errors[0]
+            _e = str(_e)
+            if len(_e) > 280:
+                _e = _e[:280] + "…"
+            human += f"
+Причина ({_m}): {_e}
+"
+            human += "Проверьте доступ к image‑моделям в OpenAI (billing/verification)."
+        await update.message.reply_text(human, reply_markup=KB)
+        return
+
+    bio = BytesIO(img_b); bio.name = "image.png"; bio.seek(0)
+
+    if plan == PLAN_FREE:
+        inc_img_usage_free(chat_id)
+    elif plan == PLAN_STANDARD:
+        inc_img_usage_std(chat_id)
+    add_history(chat_id, "image", prompt, "[image]")
+
+    await context.bot.send_photo(chat_id, photo=bio, caption="Готово ✅", reply_markup=KB)
+    return
+
     await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
     client=_client()
     prompt=text.strip()
@@ -510,6 +573,7 @@ def build_application():
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("buy",     cmd_buy))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("imgtest",  cmd_imgtest))
     app.add_handler(CommandHandler("voiceon", cmd_voiceon))
     app.add_handler(CommandHandler("voiceoff",cmd_voiceoff))
     # админ
@@ -523,3 +587,9 @@ def build_application():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
+
+
+async def cmd_imgtest(update, context):
+    # безопасный тестовый промпт
+    await handle_image(update, context, "a cute orange cat sticker, simple and clean")
+
