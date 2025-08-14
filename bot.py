@@ -1,7 +1,8 @@
-import os, time, base64, sqlite3, traceback
+import os, time, base64, sqlite3, traceback, subprocess
 from io import BytesIO
 from datetime import datetime, timezone
 from typing import Optional, Tuple
+from shutil import which
 
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
@@ -264,8 +265,8 @@ async def handle_chat(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str
                 await context.bot.send_voice(chat_id, voice=InputFile(path, filename="reply.ogg"))
             else:
                 await context.bot.send_audio(chat_id, audio=InputFile(path, filename="reply.mp3"))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[TTS-ERR] {type(e).__name__}: {e}")
 
 async def handle_image(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str):
     chat_id = update.effective_chat.id
@@ -374,37 +375,30 @@ async def on_voice(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка распознавания: {e}\n{tb}", reply_markup=KB)
 
 async def synth_tts(text:str, chat_id:int)->str:
-    """Пытается сгенерить речь в OGG/Opus (для send_voice). Фоллбэк — MP3."""
-    t=text.strip()
-    if len(t)>800: t=t[:800]
-    client=_client()
+    """Генерим MP3 через OpenAI, затем пытаемся конвертировать в OGG/Opus и возвращаем путь.
+       Если ffmpeg недоступен — шлём MP3."""
+    t = (text or "").strip()
+    if len(t) > 800:
+        t = t[:800]
+    client = _client()
 
-    # 1) Пытаемся получить opus/ogg (идеально для Telegram voice)
+    last_err = None
     for m in ("gpt-4o-mini-tts","tts-1"):
         try:
-            path=f"/tmp/tts_{chat_id}.ogg"
-            with client.audio.speech.with_streaming_response.create(
-                model=m, voice=OPENAI_TTS_VOICE, input=t, response_format="opus"
-            ) as resp:
-                resp.stream_to_file(path)
-            return path
-        except Exception:
-            continue
-
-    # 2) Фоллбэк — MP3
-    for m in ("gpt-4o-mini-tts","tts-1"):
-        try:
-            path=f"/tmp/tts_{chat_id}.mp3"
+            mp3_path = f"/tmp/tts_{chat_id}.mp3"
             with client.audio.speech.with_streaming_response.create(
                 model=m, voice=OPENAI_TTS_VOICE, input=t, response_format="mp3"
             ) as resp:
-                resp.stream_to_file(path)
-            return path
-        except Exception:
+                resp.stream_to_file(mp3_path)
+
+            ogg_path = f"/tmp/tts_{chat_id}.ogg"
+            if _mp3_to_ogg_opus(mp3_path, ogg_path):
+                return ogg_path
+            return mp3_path
+        except Exception as e:
+            last_err = e
             continue
-
-    raise RuntimeError("TTS unavailable")
-
+    raise RuntimeError(f"TTS unavailable: {last_err}")
 # ========= Commands / Buttons =========
 async def cmd_start(update, context): await update.message.reply_text("Выбери действие 👇", reply_markup=KB)
 async def cmd_help(update, context):  await update.message.reply_text(HELP_TEXT, reply_markup=KB)
@@ -591,3 +585,21 @@ def build_application():
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
+
+
+def _has_ffmpeg()->bool:
+    return bool(which("ffmpeg"))
+
+def _mp3_to_ogg_opus(mp3_path:str, ogg_path:str)->bool:
+    if not _has_ffmpeg():
+        return False
+    cmd = [
+        "ffmpeg", "-y", "-i", mp3_path,
+        "-c:a", "libopus", "-b:a", "48k", "-vbr", "on",
+        ogg_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
