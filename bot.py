@@ -139,8 +139,14 @@ def set_voice_reply(chat_id:int, val:bool):
              "ON CONFLICT(chat_id) DO UPDATE SET voice_reply=excluded.voice_reply", (chat_id, 1 if val else 0))
 
 def get_auto_mode(chat_id:int)->bool:
-    row=DBI.one("SELECT auto_mode FROM settings WHERE chat_id=?", (chat_id,))
-    return bool(row and row[0] != 0)
+    row = DBI.one("SELECT auto_mode FROM settings WHERE chat_id=?", (chat_id,))
+    # если настроек нет — считаем, что авто-режим ВКЛ по умолчанию
+    if row is None:
+        return True
+    try:
+        return bool(int(row[0]) != 0)
+    except Exception:
+        return True
 
 def set_auto_mode(chat_id:int, val:bool):
     DBI.exec("INSERT INTO settings(chat_id,auto_mode) VALUES(?,?) "
@@ -452,7 +458,9 @@ async def on_text(update, context):
 
     # Авто-режим: сам решает — текст или картинка
     if get_auto_mode(chat_id):
-        if detect_intent(text)=="image":
+        intent = detect_intent(text)
+        print(f"[INTENT] {intent}: {text[:80]!r}")
+        if intent=="image":
             await handle_image(update, context, text); return
         else:
             await handle_chat(update, context, text); return
