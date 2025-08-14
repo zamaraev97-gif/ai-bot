@@ -292,7 +292,7 @@ async def on_voice(update:Update, context:ContextTypes.DEFAULT_TYPE):
     ok,warn=allow_text(chat_id)
     if not ok: await update.message.reply_text(warn, reply_markup=KB); return
     try:
-        await context.bot.send_chat_action(chat_id, ChatAction.RECORD_AUDIO)
+        await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
         file_id = (update.message.voice or update.message.audio).file_id
         tg_file = await context.bot.get_file(file_id)
         buf = BytesIO(); await tg_file.download_to_memory(out=buf); data = buf.getvalue()
