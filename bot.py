@@ -408,22 +408,19 @@ async def cmd_wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Все твои данные в боте удалены. Начинаем с чистого листа ✨", reply_markup=KB)
 
 # Псевдо-покупка
-async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_buy(update, context):
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Купить Стандарт (200₽/мес)", callback_data="buy:standard")],
-        [InlineKeyboardButton("Купить Премиум (500₽/мес)",  callback_data="buy:premium")]
+        [InlineKeyboardButton("Купить Стандарт (200₽/мес)", url=PAYMENT_URL_STANDARD)],
+        [InlineKeyboardButton("Купить Премиум (500₽/мес)",  url=PAYMENT_URL_PREMIUM )]
     ])
     await update.message.reply_text(
-        "Выбери тариф. Оплату подключим позже (Telegram Payments или ссылка на оплату).",
+        "После оплаты доступ не открывается автоматически.
+"
+        "Мы пришлём код активации. Введи его командой:
+/redeem КОД",
         reply_markup=kb
     )
-
-# Админ-команда: /grant standard 30
-ADMIN_ID = os.getenv("ADMIN_ID")
-async def cmd_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_ID and str(update.effective_user.id) != str(ADMIN_ID):
-        await update.message.reply_text("Недостаточно прав.")
-        return
+    return
     args = (update.message.text or "").split()
     if len(args) != 3 or args[1] not in (PLAN_STANDARD, PLAN_PREMIUM):
         await update.message.reply_text("Использование: /grant standard|premium <дней>")
@@ -472,26 +469,27 @@ async def show_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     buttons = [[InlineKeyboardButton(title[:50], callback_data=f"sess:{sid}")] for sid, title, _ in sids]
     await update.message.reply_text("Выбери диалог:", reply_markup=InlineKeyboardMarkup(buttons))
 
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
+async def on_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
     if data.startswith("sess:"):
-        try:
-            sid = int(data.split(":",1)[1])
-            set_current_session(update.effective_chat.id, sid)
-            reset_usage(update.effective_chat.id)
-            await query.edit_message_text("Диалог переключён ✅", reply_markup=None)
-        except Exception:
-            await query.edit_message_text("Не удалось переключить диалог.", reply_markup=None)
-    elif data == "buy:standard":
-        set_plan(update.effective_chat.id, PLAN_STANDARD, 30)
-        await query.edit_message_text("Тариф “Стандарт” активирован на 30 дней ✅")
-    elif data == "buy:premium":
-        set_plan(update.effective_chat.id, PLAN_PREMIUM, 30)
-        await query.edit_message_text("Тариф “Премиум” активирован на 30 дней ✅")
+        sid = int(data.split(":",1)[1])
+        set_current_session(update.effective_chat.id, sid)
+        reset_usage(update.effective_chat.id)
+        await q.edit_message_text("Диалог переключён ✅")
+        return
+    elif data.startswith("buy:"):
+        await q.edit_message_text(
+            "Оплата по кнопке не активирует доступ автоматически.
+"
+            "После оплаты введи код: /redeem КОД"
+        )
+        return
+    else:
+        await q.edit_message_text("Ок ✅")
+        return
 
-# ——— Роутер текста ———
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     chat_id = update.effective_chat.id
@@ -868,3 +866,25 @@ def _parse_size_flag(text: str, default: str = "1024x1024"):
 
     return cleaned or raw.strip(), chosen
 # --- end robust size parser ---
+
+
+def detect_intent(text:str)->str:
+    t = (text or "").lower()
+    gen_markers = [
+        # RU
+        "сгенерируй","создай картинку","создай изображение","сделай картинку",
+        "сделай изображение","нарисуй","изобрази","сгенери","генерация",
+        "картинку","картинка","изображение","постер","логотип","логитип",
+        "афишу","обложку","арт","иллюстрацию","концепт-арт","концепт арт",
+        "баннер","визуал","дизайн","иконку","эмблему",
+        # EN
+        "make an image","generate an image","create an image","draw",
+        "render","make a poster","logo","poster","artwork","illustration",
+        "concept art","image of","picture of",
+        # hints
+        "--size"," ratio ","размер ","16:9","9:16","1024x","x1024","1792x1024","1024x1792"
+    ]
+    if any(k in t for k in gen_markers):
+        return "image"
+    return "chat"
+
