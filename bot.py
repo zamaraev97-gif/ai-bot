@@ -290,13 +290,27 @@ async def handle_image(update:Update, context:ContextTypes.DEFAULT_TYPE, text:st
 
     for m in prefs:
         try:
-            kwargs = {"model": m, "prompt": prompt, "size": "1024x1024"}
+            kwargs = {"model": m, "prompt": prompt, "size": "1024x1024", "response_format": "b64_json"}
             if (m or "").lower() == "dall-e-3":
                 kwargs["quality"] = "standard"
             print(f"[IMG] try model={m} prompt={prompt[:80]!r}")
             gen = client.images.generate(**kwargs)
-            b64 = gen.data[0].b64_json
-            img_b = base64.b64decode(b64)
+            img_b = None
+            try:
+                b64 = getattr(gen.data[0], "b64_json", None)
+                if b64:
+                    img_b = base64.b64decode(b64)
+                else:
+                    url = getattr(gen.data[0], "url", None)
+                    if url:
+                        import requests
+                        r = requests.get(url, timeout=60)
+                        r.raise_for_status()
+                        img_b = r.content
+                    else:
+                        raise ValueError("no b64_json or url in response")
+            except Exception as e2:
+                raise e2
             print(f"[IMG] success model={m}")
             break
         except Exception as e:
