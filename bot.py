@@ -1,890 +1,517 @@
-import os, base64, sqlite3, time, traceback, datetime
+import os, time, base64, sqlite3, traceback
 from io import BytesIO
-from typing import List, Tuple, Optional
-from dotenv import load_dotenv
+from datetime import datetime, timezone
+from typing import Optional, Tuple
+
 from telegram import (
-    Update, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, InputFile
+    Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
+    InlineKeyboardButton, InputFile
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+
 from openai import OpenAI, BadRequestError, APIStatusError, PermissionDeniedError
 
-load_dotenv()
+# ========= ENV =========
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+TEXT_PREFS = [
+    os.getenv("OPENAI_TEXT_PRIMARY","gpt-5").strip(),
+    "gpt-5-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4o-mini"
+]
+IMAGE_PREFS = [
+    os.getenv("OPENAI_IMAGE_PRIMARY","dall-e-3").strip(),
+    "gpt-image-1"
+]
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy")
+OPENAI_TIMEOUT_S = float(os.getenv("OPENAI_TIMEOUT_S", "60"))
 
-# === OpenAI only ===
-TG_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-API_KEY    = os.getenv("OPENAI_API_KEY")                # sk-...
-BASE_URL   = "https://api.openai.com/v1"
-SYSTEM     = os.getenv("SYSTEM_PROMPT", "You are a helpful assistant.")
+PAYMENT_URL_STANDARD = os.getenv("PAYMENT_URL_STANDARD", "https://example.com/pay-standard")
+PAYMENT_URL_PREMIUM  = os.getenv("PAYMENT_URL_PREMIUM",  "https://example.com/pay-premium")
+ADMIN_ID             = os.getenv("ADMIN_ID","")
 
-# Модели (имена не показываем)
-TEXT_PREFS   = [m.strip() for m in os.getenv(
-    "OPENAI_TEXT_PREFS",   "gpt-5,gpt-5-mini,gpt-4o,gpt-4.1-mini"
-).split(",") if m.strip()]
-VISION_PREFS = [m.strip() for m in os.getenv(
-    "OPENAI_VISION_PREFS", "gpt-5,gpt-4o,gpt-4.1,gpt-5-mini"
-).split(",") if m.strip()]
-IMAGE_PRIMARY   = os.getenv("OPENAI_IMAGE_PRIMARY", "dall-e-3")
-IMAGE_FALLBACK  = os.getenv("OPENAI_IMAGE_FALLBACK", "gpt-image-1")
+FREE_DAILY_TEXT   = int(os.getenv("FREE_DAILY_LIMIT", "15"))
+FREE_DAILY_IMAGE  = int(os.getenv("FREE_DAILY_IMAGE", "3"))
+STANDARD_IMG_MONTH = int(os.getenv("STANDARD_IMG_MONTHLY", "20"))
 
-# === Тарифы ===
-PLAN_FREE       = "free"       # 15 запросов/сутки
-PLAN_STANDARD   = "standard"   # 200₽/мес, 20 картинок/мес
-PLAN_PREMIUM    = "premium"    # 500₽/мес, без лимитов
-FREE_DAILY_LIMIT      = int(os.getenv("FREE_DAILY_LIMIT", "15"))
-STANDARD_IMG_MONTHLY  = int(os.getenv("STANDARD_IMG_MONTHLY", "20"))
+PLAN_FREE, PLAN_STANDARD, PLAN_PREMIUM = "free", "standard", "premium"
 
-# === SQLite: история, режим, сессии, usage, планы ===
-DB_PATH = os.getenv("STATE_DB_PATH", "state.db")
+# ========= OPENAI =========
+def _client():
+    return OpenAI(api_key=OPENAI_API_KEY)
 
-def _db():
-    conn = sqlite3.connect(DB_PATH)
-    # messages
-    conn.execute("""CREATE TABLE IF NOT EXISTS messages(
-        chat_id INTEGER,
-        role TEXT,
-        content TEXT,
-        ts REAL,
-        session_id INTEGER
-    )""")
-    # prefs
-    conn.execute("""CREATE TABLE IF NOT EXISTS prefs(
-        chat_id INTEGER PRIMARY KEY,
-        mode TEXT,
-        current_session_id INTEGER
-    )""")
-    # sessions
-    conn.execute("""CREATE TABLE IF NOT EXISTS sessions(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        chat_id INTEGER,
-        title TEXT,
-        created_at REAL
-    )""")
-    # usage (free daily)
-    conn.execute("""CREATE TABLE IF NOT EXISTS usage(
-        chat_id INTEGER,
-        ymd TEXT,
-        count INTEGER,
-        PRIMARY KEY(chat_id, ymd)
-    )""")
-    # plans
-    conn.execute("""CREATE TABLE IF NOT EXISTS plans(
-        chat_id INTEGER PRIMARY KEY,
-        plan TEXT,
-        expires_at REAL
-    )""")
-    # img_usage (standard monthly)
-    conn.execute("""CREATE TABLE IF NOT EXISTS img_usage(
-        chat_id INTEGER,
-        ym TEXT,
-        count INTEGER,
-        PRIMARY KEY(chat_id, ym)
-    )""")
-    conn.commit()
-    return conn
+# ========= DB (SQLite — просто и надёжно; на Render подойдёт) =========
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-# ——— helpers: время/форматы ———
-def _today():
-    return datetime.date.today().isoformat()
+class DB:
+    def __init__(self, path:str):
+        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL;")
+        self.ensure()
 
-def _year_month():
-    d = datetime.date.today()
-    return f"{d.year:04d}-{d.month:02d}"
+    def ensure(self):
+        c=self.db.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS plans(
+            chat_id INTEGER PRIMARY KEY, plan TEXT, expires_at REAL
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS usage_daily(
+            chat_id INTEGER, ymd TEXT, text_cnt INTEGER DEFAULT 0, img_cnt INTEGER DEFAULT 0,
+            PRIMARY KEY(chat_id, ymd)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS usage_img_month(
+            chat_id INTEGER, ym TEXT, cnt INTEGER DEFAULT 0,
+            PRIMARY KEY(chat_id, ym)
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER, ts REAL, kind TEXT, prompt TEXT, response TEXT
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS settings(
+            chat_id INTEGER PRIMARY KEY,
+            voice_reply INTEGER DEFAULT 0,
+            auto_mode  INTEGER DEFAULT 1
+        )""")
+        c.execute("""CREATE TABLE IF NOT EXISTS redeem_codes(
+            code TEXT PRIMARY KEY, plan TEXT, days INTEGER, used INTEGER DEFAULT 0
+        )""")
+        self.db.commit()
 
-def _now_title() -> str:
-    return "Диалог от " + datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+    def exec(self, q, p=()):
+        self.db.execute(q,p); self.db.commit()
+    def one(self, q, p=()):
+        cur=self.db.execute(q,p); return cur.fetchone()
+    def all(self, q, p=()):
+        cur=self.db.execute(q,p); return cur.fetchall()
 
-# ——— usage (free daily) ———
-def inc_usage(chat_id: int) -> int:
-    conn = _db()
-    ymd = _today()
-    cur = conn.execute("SELECT count FROM usage WHERE chat_id=? AND ymd=?", (chat_id, ymd))
-    row = cur.fetchone()
-    if row:
-        newc = row[0] + 1
-        conn.execute("UPDATE usage SET count=? WHERE chat_id=? AND ymd=?", (newc, chat_id, ymd))
-    else:
-        newc = 1
-        conn.execute("INSERT INTO usage(chat_id,ymd,count) VALUES(?,?,?)", (chat_id, ymd, newc))
-    conn.commit(); conn.close()
-    return newc
+DBI=DB(DB_PATH)
 
-def get_usage(chat_id: int) -> int:
-    conn = _db()
-    cur = conn.execute("SELECT count FROM usage WHERE chat_id=? AND ymd=?", (chat_id, _today()))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
+# ========= Plans / Usage =========
+def _now(): return time.time()
+def _ymd(): return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _ym():  return datetime.now(timezone.utc).strftime("%Y-%m")
 
-def reset_usage(chat_id: int):
-    conn = _db()
-    conn.execute("DELETE FROM usage WHERE chat_id=? AND ymd=?", (chat_id, _today()))
-    conn.commit(); conn.close()
+def get_plan(chat_id:int)->Tuple[str, Optional[float]]:
+    row=DBI.one("SELECT plan, expires_at FROM plans WHERE chat_id=?", (chat_id,))
+    if not row: return PLAN_FREE, None
+    plan, exp=row
+    if exp and exp<_now(): return PLAN_FREE, None
+    return plan or PLAN_FREE, exp
 
-# ——— img usage (standard monthly) ———
-def inc_img_month(chat_id: int) -> int:
-    conn = _db()
-    ym = _year_month()
-    cur = conn.execute("SELECT count FROM img_usage WHERE chat_id=? AND ym=?", (chat_id, ym))
-    row = cur.fetchone()
-    if row:
-        newc = row[0] + 1
-        conn.execute("UPDATE img_usage SET count=? WHERE chat_id=? AND ym=?", (newc, chat_id, ym))
-    else:
-        newc = 1
-        conn.execute("INSERT INTO img_usage(chat_id,ym,count) VALUES(?,?,?)", (chat_id, ym, newc))
-    conn.commit(); conn.close()
-    return newc
+def set_plan(chat_id:int, plan:str, days:int):
+    exp = _now()+days*86400 if days and plan!=PLAN_FREE else None
+    DBI.exec("INSERT INTO plans(chat_id,plan,expires_at) VALUES(?,?,?) "
+             "ON CONFLICT(chat_id) DO UPDATE SET plan=excluded.plan, expires_at=excluded.expires_at",
+             (chat_id, plan, exp))
 
-def get_img_month(chat_id: int) -> int:
-    conn = _db()
-    cur = conn.execute("SELECT count FROM img_usage WHERE chat_id=? AND ym=?", (chat_id, _year_month()))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else 0
+def inc_text_usage(chat_id:int):
+    DBI.exec("INSERT INTO usage_daily(chat_id,ymd,text_cnt,img_cnt) VALUES(?,?,1,0) "
+             "ON CONFLICT(chat_id,ymd) DO UPDATE SET text_cnt=text_cnt+1", (chat_id,_ymd()))
 
-# ——— sessions/messages ———
-def get_mode(chat_id: int) -> str:
-    conn = _db()
-    cur = conn.execute("SELECT mode FROM prefs WHERE chat_id=?", (chat_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else "chat"
+def inc_img_usage_free(chat_id:int):
+    DBI.exec("INSERT INTO usage_daily(chat_id,ymd,text_cnt,img_cnt) VALUES(?,?,0,1) "
+             "ON CONFLICT(chat_id,ymd) DO UPDATE SET img_cnt=img_cnt+1", (chat_id,_ymd()))
 
-def set_mode(chat_id: int, mode: str):
-    conn = _db()
-    conn.execute(
-        "INSERT INTO prefs(chat_id,mode,current_session_id) VALUES(?,?,COALESCE((SELECT current_session_id FROM prefs WHERE chat_id=?),NULL)) "
-        "ON CONFLICT(chat_id) DO UPDATE SET mode=excluded.mode",
-        (chat_id, mode, chat_id)
-    )
-    conn.commit(); conn.close()
+def inc_img_usage_std(chat_id:int):
+    DBI.exec("INSERT INTO usage_img_month(chat_id,ym,cnt) VALUES(?,?,1) "
+             "ON CONFLICT(chat_id,ym) DO UPDATE SET cnt=cnt+1", (chat_id,_ym()))
 
-def ensure_session(chat_id: int) -> int:
-    conn = _db()
-    cur = conn.execute("SELECT current_session_id FROM prefs WHERE chat_id=?", (chat_id,))
-    row = cur.fetchone()
-    if row and row[0]:
-        sid = int(row[0])
-        cur2 = conn.execute("SELECT id FROM sessions WHERE id=? AND chat_id=?", (sid, chat_id))
-        if cur2.fetchone():
-            conn.close(); return sid
-    title = _now_title(); now = time.time()
-    conn.execute("INSERT INTO sessions(chat_id,title,created_at) VALUES(?,?,?)", (chat_id, title, now))
-    sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.execute(
-        "INSERT INTO prefs(chat_id,mode,current_session_id) VALUES(?,?,?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET current_session_id=excluded.current_session_id",
-        (chat_id, "chat", sid)
-    )
-    conn.commit(); conn.close()
-    return sid
+def get_text_usage_today(chat_id:int)->int:
+    row=DBI.one("SELECT text_cnt FROM usage_daily WHERE chat_id=? AND ymd=?", (chat_id,_ymd()))
+    return int(row[0]) if row else 0
 
-def set_current_session(chat_id: int, session_id: int):
-    conn = _db()
-    cur = conn.execute("SELECT id FROM sessions WHERE id=? AND chat_id=?", (session_id, chat_id))
-    if not cur.fetchone():
-        conn.close(); return
-    conn.execute(
-        "INSERT INTO prefs(chat_id,mode,current_session_id) VALUES(?,?,?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET current_session_id=excluded.current_session_id",
-        (chat_id, get_mode(chat_id), session_id)
-    )
-    conn.commit(); conn.close()
+def get_img_usage_today_free(chat_id:int)->int:
+    row=DBI.one("SELECT img_cnt FROM usage_daily WHERE chat_id=? AND ymd=?", (chat_id,_ymd()))
+    return int(row[0]) if row else 0
 
-def list_sessions(chat_id: int, limit: int = 10) -> List[Tuple[int,str,float]]:
-    conn = _db()
-    cur = conn.execute(
-        "SELECT id,title,created_at FROM sessions WHERE chat_id=? ORDER BY created_at DESC LIMIT ?",
-        (chat_id, limit)
-    )
-    rows = cur.fetchall(); conn.close()
-    return rows
+def get_img_usage_month_std(chat_id:int)->int:
+    row=DBI.one("SELECT cnt FROM usage_img_month WHERE chat_id=? AND ym=?", (chat_id,_ym()))
+    return int(row[0]) if row else 0
 
-def rename_session(chat_id: int, session_id: int, new_title: str) -> bool:
-    conn = _db()
-    cur = conn.execute("UPDATE sessions SET title=? WHERE id=? AND chat_id=?", (new_title, session_id, chat_id))
-    conn.commit()
-    ok = cur.rowcount > 0
-    conn.close()
-    return ok
+def get_voice_reply(chat_id:int)->bool:
+    row=DBI.one("SELECT voice_reply FROM settings WHERE chat_id=?", (chat_id,))
+    return bool(row and row[0])
 
-def delete_current_session(chat_id: int) -> bool:
-    conn = _db()
-    cur = conn.execute("SELECT current_session_id FROM prefs WHERE chat_id=?", (chat_id,))
-    row = cur.fetchone()
-    if not row or not row[0]:
-        conn.close(); return False
-    sid = int(row[0])
-    conn.execute("DELETE FROM messages WHERE chat_id=? AND session_id=?", (chat_id, sid))
-    conn.execute("DELETE FROM sessions WHERE id=? AND chat_id=?", (sid, chat_id))
-    title = _now_title(); now = time.time()
-    conn.execute("INSERT INTO sessions(chat_id,title,created_at) VALUES(?,?,?)", (chat_id, title, now))
-    new_sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-    conn.execute("UPDATE prefs SET current_session_id=? WHERE chat_id=?", (new_sid, chat_id))
-    conn.commit(); conn.close()
-    return True
+def set_voice_reply(chat_id:int, val:bool):
+    DBI.exec("INSERT INTO settings(chat_id,voice_reply) VALUES(?,?) "
+             "ON CONFLICT(chat_id) DO UPDATE SET voice_reply=excluded.voice_reply", (chat_id, 1 if val else 0))
 
-def delete_all_user_data(chat_id: int):
-    conn = _db()
-    conn.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
-    conn.execute("DELETE FROM sessions WHERE chat_id=?", (chat_id,))
-    conn.execute("DELETE FROM usage WHERE chat_id=?", (chat_id,))
-    conn.execute("DELETE FROM img_usage WHERE chat_id=?", (chat_id,))
-    conn.execute("DELETE FROM prefs WHERE chat_id=?", (chat_id,))
-    # планы оставляем (чтобы не терять оплаты); если не нужно — раскомментируй следующую строку:
-    # conn.execute("DELETE FROM plans WHERE chat_id=?", (chat_id,))
-    conn.commit(); conn.close()
+def get_auto_mode(chat_id:int)->bool:
+    row=DBI.one("SELECT auto_mode FROM settings WHERE chat_id=?", (chat_id,))
+    return bool(row and row[0] != 0)
 
-def get_current_session(chat_id: int) -> Tuple[int, str]:
-    conn = _db()
-    sid = ensure_session(chat_id)
-    cur = conn.execute("SELECT title FROM sessions WHERE id=?", (sid,))
-    title = cur.fetchone()[0]
-    conn.close()
-    return sid, title
+def set_auto_mode(chat_id:int, val:bool):
+    DBI.exec("INSERT INTO settings(chat_id,auto_mode) VALUES(?,?) "
+             "ON CONFLICT(chat_id) DO UPDATE SET auto_mode=excluded.auto_mode", (chat_id, 1 if val else 0))
 
-def save_msg(chat_id: int, session_id: int, role: str, content: str):
-    conn = _db()
-    conn.execute(
-        "INSERT INTO messages(chat_id,role,content,ts,session_id) VALUES(?,?,?,?,?)",
-        (chat_id, role, content, time.time(), session_id)
-    )
-    conn.commit(); conn.close()
+def add_history(chat_id:int, kind:str, prompt:str, response:str):
+    DBI.exec("INSERT INTO history(chat_id,ts,kind,prompt,response) VALUES(?,?,?,?,?)",
+             (chat_id,_now(),kind,prompt,response))
 
-def load_history(chat_id: int, session_id: int, limit: int = 20) -> List[Tuple[str,str]]:
-    conn = _db()
-    cur = conn.execute(
-        "SELECT role, content FROM messages WHERE chat_id=? AND session_id=? ORDER BY ts DESC LIMIT ?",
-        (chat_id, session_id, limit)
-    )
-    rows = cur.fetchall(); conn.close()
-    rows.reverse()
-    return rows
+def last_history(chat_id:int, n:int=5):
+    return DBI.all("SELECT ts,kind,prompt,response FROM history WHERE chat_id=? ORDER BY ts DESC LIMIT ?",
+                   (chat_id, n))
 
-# ——— планы ———
-def get_plan(chat_id: int) -> Tuple[str, Optional[float]]:
-    conn = _db()
-    cur = conn.execute("SELECT plan,expires_at FROM plans WHERE chat_id=?", (chat_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return PLAN_FREE, None
-    plan, exp = row[0], row[1]
-    if plan in (PLAN_STANDARD, PLAN_PREMIUM) and exp and exp < time.time():
-        return PLAN_FREE, None
-    return plan, exp
-
-def set_plan(chat_id: int, plan: str, days: int):
-    exp = time.time() + days * 86400
-    conn = _db()
-    conn.execute("INSERT INTO plans(chat_id,plan,expires_at) VALUES(?,?,?) "
-                 "ON CONFLICT(chat_id) DO UPDATE SET plan=excluded.plan, expires_at=excluded.expires_at",
-                 (chat_id, plan, exp))
-    conn.execute("DELETE FROM img_usage WHERE chat_id=?", (chat_id,))
-    conn.commit(); conn.close()
-
-# ——— OpenAI client ———
-def _client() -> OpenAI:
-    if not API_KEY:
-        raise RuntimeError("OPENAI_API_KEY is not set")
-    return OpenAI(api_key=API_KEY, base_url=BASE_URL)
-
-# ——— Клавиатуры ———
-BTN_CHAT = "💬 Болталка"
-BTN_IMG  = "🖼️ Генерация фото"
-BTN_NEW  = "🆕 Новый диалог"
-BTN_LIST = "📜 Мои диалоги"
-BTN_DEL  = "🗑 Удалить диалог"
-BTN_HELP = "ℹ️ Помощь"
-BTN_MENU = "🔙 Меню"
-BTN_PRIC = "💳 Тарифы"
-BTN_STAT = "👤 Мой статус"
-BTN_PRIV = "🔒 Политика"
-BTN_WIPE = "🧽 Удалить данные"
+# ========= UI =========
+BTN_CHAT="💬 Болталка"
+BTN_IMG="🎨 Генерация фото"
+BTN_VOICE="🎤 Голосовой чат"
+BTN_HIST="📜 Моя история"
+BTN_TARIFF="💳 Тарифы"
+BTN_HELP="ℹ Инструкция"
 
 KB = ReplyKeyboardMarkup(
     [[KeyboardButton(BTN_CHAT), KeyboardButton(BTN_IMG)],
-     [KeyboardButton(BTN_NEW),  KeyboardButton(BTN_LIST)],
-     [KeyboardButton(BTN_DEL),  KeyboardButton(BTN_HELP)],
-     [KeyboardButton(BTN_PRIC), KeyboardButton(BTN_STAT)],
-     [KeyboardButton(BTN_PRIV), KeyboardButton(BTN_WIPE)],
-     [KeyboardButton(BTN_MENU)]],
-    resize_keyboard=True, one_time_keyboard=False
+     [KeyboardButton(BTN_VOICE), KeyboardButton(BTN_HIST)],
+     [KeyboardButton(BTN_TARIFF), KeyboardButton(BTN_HELP)]],
+    resize_keyboard=True
 )
 
-HELP_TEXT = (
-    "Как пользоваться:\n"
-    "• Кнопки внизу помогают быстро переключаться.\n"
-    "• Болталка — обычный чат (контекст по текущему диалогу).\n"
-    "• Генерация фото — опиши картинку (можно --size 1024x1792).\n"
-    "• Мультидиалоги: Новый / Мои диалоги / Удалить / /rename / /export / /reset.\n"
-    "• Тарифы: Free (15/сутки), Standard (200₽/мес, 20 img/мес), Premium (500₽/мес, без лимитов).\n"
-    "• Приватность — см. “🔒 Политика”. Удалить всё — “🧽 Удалить данные”.\n"
+HELP_TEXT=(
+"👋 Привет! Я помогу поболтать, сгенерировать картинку и распознать голос.\n\n"
+"Как пользоваться:\n"
+"• 💬 Болталка — просто пиши вопросы.\n"
+"• 🎨 Генерация фото — опиши идею картинки (без доп.параметров).\n"
+"• 🎤 Голосовой чат — отправь voice: я распознаю и отвечу. Хочешь — включу ответ голосом.\n"
+"• 📜 Моя история — последние 5 запросов.\n\n"
+"Тарифы:\n"
+"🆓 Бесплатно — 15 текстовых / 3 картинки в день.\n"
+"💼 Стандарт — 200₽/мес (20 картинок/мес, текст без лимита).\n"
+"👑 Премиум — 500₽/мес (всё без ограничений).\n"
+"Платные планы активируются только кодом: /redeem КОД\n"
 )
 
-PRICING_TEXT = (
-    "Тарифы:\n"
-    "• Бесплатный — 15 запросов/сутки (текст+картинки суммарно).\n"
-    "• Стандарт — 200₽/мес, картинки: 20 в месяц, текст — без ограничений.\n"
-    "• Премиум — 500₽/мес, без ограничений.\n\n"
-    "Оплату подключим позже (Telegram Payments или внешний провайдер). Пока можно активировать через кнопки ниже."
+PRICING_TEXT=(
+"💳 Тарифы\n\n"
+"🆓 Бесплатный — 15 текстовых / 3 картинки в день.\n"
+"💼 Стандарт — 200₽/мес, 20 картинок/мес.\n"
+"👑 Премиум — 500₽/мес, без ограничений.\n\n"
+"После оплаты получишь код и активируешь: /redeem КОД"
 )
 
-PRIVACY_TEXT = (
-    "🔒 Политика конфиденциальности\n\n"
-    "• Основа: бот работает на базе моделей ChatGPT от OpenAI (через OpenAI API).\n"
-    "• Что отправляем: ваши сообщения, а также вложения (например, изображения для анализа) отправляются в OpenAI для обработки и генерации ответа.\n"
-    "• Хранение у нас: история диалогов и настройки сохраняются в нашей базе (SQLite на сервере) для удобства — чтобы помнить контекст и ваши диалоги.\n"
-    "• Хранение у OpenAI: обработка и хранение данных регулируются политиками OpenAI. Подробности см. в их документации и политике приватности на сайте OpenAI.\n"
-    "• Зачем данные: чтобы отвечать, помнить контекст, улучшать качество сервиса (на нашей стороне — только функционально необходимые данные).\n"
-    "• Безопасность: доступ к базе ограничен; ключи находятся в переменных окружения. Пожалуйста, не отправляйте чувствительные данные, если в этом нет необходимости.\n"
-    "• Управление данными: вы можете удалить историю текущего диалога (/reset), удалить диалог, либо стереть все свои данные в боте (кнопка “🧽 Удалить данные” или команда /wipe).\n"
-    "• Связь: по вопросам приватности и данных — напишите администратору бота.\n"
-)
+# ========= Intent =========
+def detect_intent(text:str)->str:
+    t=(text or "").lower()
+    markers=[
+        "сгенерируй","создай картинку","создай изображение","сделай картинку","сделай изображение",
+        "нарисуй","изобрази","постер","логотип","обложку","арт","иллюстрацию","баннер","визуал",
+        "make an image","generate an image","create an image","draw","poster","logo","artwork","illustration",
+    ]
+    return "image" if any(k in t for k in markers) else "chat"
 
-# ——— Команды ———
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sid, title = get_current_session(chat_id)
-    await update.message.reply_text(
-        f"Привет! Текущий диалог: “{title}”.\n\n{HELP_TEXT}",
-        reply_markup=KB
-    )
+# ========= Access checks =========
+def allow_text(chat_id:int)->Tuple[bool,str]:
+    plan,_=get_plan(chat_id)
+    if plan==PLAN_FREE:
+        used=get_text_usage_today(chat_id)
+        if used>=FREE_DAILY_TEXT:
+            return False,"❌ Лимит бесплатных текстовых запросов на сегодня исчерпан. Оформите тариф в меню «💳 Тарифы»."
+    return True,""
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT, reply_markup=KB)
+def allow_image(chat_id:int)->Tuple[bool,str,str]:
+    plan,_=get_plan(chat_id)
+    if plan==PLAN_FREE:
+        used=get_img_usage_today_free(chat_id)
+        if used>=FREE_DAILY_IMAGE:
+            return False,"❌ Лимит бесплатных картинок на сегодня исчерпан. Оформите тариф в меню «💳 Тарифы».",PLAN_FREE
+        return True,"",PLAN_FREE
+    if plan==PLAN_STANDARD:
+        used=get_img_usage_month_std(chat_id)
+        if used>=STANDARD_IMG_MONTH:
+            return False,"❌ Лимит картинок по «Стандарт» исчерпан за месяц. Обновите тариф.",PLAN_STANDARD
+        return True,"",PLAN_STANDARD
+    return True,"",PLAN_PREMIUM
 
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Меню открыто.", reply_markup=KB)
+# ========= Core: text / image / voice =========
+async def handle_chat(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str):
+    chat_id=update.effective_chat.id
+    ok,warn=allow_text(chat_id)
+    if not ok:
+        await update.message.reply_text(warn, reply_markup=KB); return
+    await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    msgs=[{"role":"system","content":"Ты дружелюбный, краткий и полезный помощник."},
+          {"role":"user","content":text}]
+    client=_client()
+    out=None
+    for model in TEXT_PREFS:
+        try:
+            r=client.chat.completions.create(model=model, messages=msgs, temperature=0.6, timeout=OPENAI_TIMEOUT_S)
+            out=(r.choices[0].message.content or "").strip()
+            if out: break
+        except Exception:
+            continue
+    if not out:
+        await update.message.reply_text("Не удалось ответить. Попробуйте ещё раз.", reply_markup=KB); return
 
-async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sid, title = get_current_session(chat_id)
-    clear_history(chat_id, sid)
-    reset_usage(chat_id)
-    await update.message.reply_text(f"История диалога “{title}” очищена ✅", reply_markup=KB)
+    if get_plan(chat_id)[0]==PLAN_FREE: inc_text_usage(chat_id)
+    add_history(chat_id,"text",text,out)
+    await update.message.reply_text(out, reply_markup=KB)
 
-async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = (update.message.text or "").split(" ", 1)
-    if len(args) < 2 or not args[1].strip():
-        await update.message.reply_text("Использование: /rename Новое название диалога")
-        return
-    new_title = args[1].strip()
-    chat_id = update.effective_chat.id
-    sid, _ = get_current_session(chat_id)
-    if rename_session(chat_id, sid, new_title):
-        await update.message.reply_text(f"Диалог переименован в “{new_title}” ✅", reply_markup=KB)
-    else:
-        await update.message.reply_text("Не удалось переименовать.", reply_markup=KB)
+    # при включённом голосовом ответе — озвучим
+    if get_voice_reply(chat_id):
+        try:
+            path = await synth_tts(out, chat_id)
+            await context.bot.send_audio(chat_id, audio=InputFile(path, filename="reply.mp3"))
+        except Exception:
+            pass
 
-async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sid, title = get_current_session(chat_id)
-    rows = load_history(chat_id, sid, limit=1000)
-    if not rows:
-        await update.message.reply_text("В этом диалоге пока пусто.", reply_markup=KB)
-        return
-    lines = [f"TITLE: {title}", f"EXPORTED_AT: {datetime.datetime.now().isoformat()}",
-             "-"*40]
-    for role, content in rows:
-        who = "USER" if role=="user" else "ASSISTANT"
-        lines.append(f"{who}: {content}")
-    content = "\n".join(lines)
-    bio = BytesIO(content.encode("utf-8")); bio.seek(0)
-    await update.message.reply_document(document=InputFile(bio, filename=f"dialog_{sid}.txt"),
-                                        caption="Экспорт диалога")
+async def handle_image(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str):
+    chat_id=update.effective_chat.id
+    ok,warn,plan=allow_image(chat_id)
+    if not ok:
+        await update.message.reply_text(warn, reply_markup=KB); return
+    await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+    client=_client()
+    prompt=text.strip()
+    img_b=None
+    # пробуем по списку моделей, без параметров качества/размера
+    for m in IMAGE_PREFS:
+        try:
+            gen=client.images.generate(model=m, prompt=prompt)  # пусть будет дефолтная конфигурация
+            b64=gen.data[0].b64_json
+            img_b=base64.b64decode(b64); break
+        except (PermissionDeniedError,BadRequestError):
+            continue
+        except Exception:
+            continue
+    if not img_b:
+        await update.message.reply_text("Не удалось сгенерировать изображение.", reply_markup=KB); return
+    bio=BytesIO(img_b); bio.name="image.png"; bio.seek(0)
 
-async def cmd_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(PRIVACY_TEXT, reply_markup=KB)
+    # учёт лимитов
+    if plan==PLAN_FREE: inc_img_usage_free(chat_id)
+    elif plan==PLAN_STANDARD: inc_img_usage_std(chat_id)
+    add_history(chat_id,"image",prompt,"[image]")
 
-async def cmd_wipe(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    delete_all_user_data(chat_id)
-    await update.message.reply_text("Все твои данные в боте удалены. Начинаем с чистого листа ✨", reply_markup=KB)
+    await context.bot.send_photo(chat_id, photo=bio, caption="Готово ✅", reply_markup=KB)
 
-# Псевдо-покупка
+async def on_voice(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    chat_id=update.effective_chat.id
+    ok,warn=allow_text(chat_id)
+    if not ok: await update.message.reply_text(warn, reply_markup=KB); return
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.RECORD_AUDIO)
+        file_id = (update.message.voice or update.message.audio).file_id
+        tg_file = await context.bot.get_file(file_id)
+        buf = BytesIO(); await tg_file.download_to_memory(out=buf); data = buf.getvalue()
+
+        # ASR
+        text=None
+        for m in ("gpt-4o-mini-transcribe","whisper-1"):
+            try:
+                tmp=BytesIO(data); tmp.name="voice.ogg"
+                res=_client().audio.transcriptions.create(model=m, file=tmp)
+                text=(getattr(res,"text",None) or "").strip()
+                if text: break
+            except Exception:
+                continue
+        if not text:
+            await update.message.reply_text("Не удалось распознать голос.", reply_markup=KB); return
+
+        await handle_chat(update, context, text)
+    except Exception as e:
+        tb=traceback.format_exc(limit=2)
+        await update.message.reply_text(f"Ошибка распознавания: {e}\n{tb}", reply_markup=KB)
+
+async def synth_tts(text:str, chat_id:int)->str:
+    t=text.strip()
+    if len(t)>800: t=t[:800]
+    path=f"/tmp/tts_{chat_id}.mp3"
+    client=_client()
+    for m in ("gpt-4o-mini-tts","tts-1"):
+        try:
+            with client.audio.speech.with_streaming_response.create(
+                model=m, voice=OPENAI_TTS_VOICE, input=t
+            ) as resp:
+                resp.stream_to_file(path)
+            return path
+        except Exception:
+            continue
+    raise RuntimeError("TTS unavailable")
+
+# ========= Commands / Buttons =========
+async def cmd_start(update, context): await update.message.reply_text("Выбери действие 👇", reply_markup=KB)
+async def cmd_help(update, context):  await update.message.reply_text(HELP_TEXT, reply_markup=KB)
+
 async def cmd_buy(update, context):
-    kb = InlineKeyboardMarkup([
+    kb=InlineKeyboardMarkup([
         [InlineKeyboardButton("Купить Стандарт (200₽/мес)", url=PAYMENT_URL_STANDARD)],
         [InlineKeyboardButton("Купить Премиум (500₽/мес)",  url=PAYMENT_URL_PREMIUM )]
     ])
     await update.message.reply_text(
-        "После оплаты доступ не открывается автоматически.
-"
-        "Мы пришлём код активации. Введи его командой:
-/redeem КОД",
+        "После оплаты доступ не открывается автоматически.\n"
+        "Мы пришлём код активации. Введи его командой:\n"
+        "/redeem КОД",
         reply_markup=kb
     )
-    return
-    args = (update.message.text or "").split()
-    if len(args) != 3 or args[1] not in (PLAN_STANDARD, PLAN_PREMIUM):
-        await update.message.reply_text("Использование: /grant standard|premium <дней>")
-        return
-    try:
-        days = int(args[2])
-    except:
-        await update.message.reply_text("Дни должны быть числом.")
-        return
-    set_plan(update.effective_chat.id, args[1], days)
-    await update.message.reply_text(f"Выдан тариф {args[1]} на {days} дн. ✅")
 
-# ——— тарифный контроль ———
-def _allow_text(chat_id: int) -> Tuple[bool, str]:
-    plan, exp = get_plan(chat_id)
-    if plan == PLAN_PREMIUM:
-        return True, ""
-    if plan == PLAN_STANDARD:
-        return True, ""
-    used = get_usage(chat_id)
-    if used >= FREE_DAILY_LIMIT:
-        return False, f"Превышен дневной лимит {FREE_DAILY_LIMIT}. Выбери тариф в “{BTN_PRIC}” или попробуй завтра."
-    return True, ""
+def _gen_hist_line(ts, kind, prompt, response):
+    dt=datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m %H:%M")
+    if kind=="image":
+        return f"• [{dt}] картинка: {prompt[:60]}…"
+    return f"• [{dt}] текст: {prompt[:60]}…"
 
-def _allow_image(chat_id: int) -> Tuple[bool, str]:
-    plan, exp = get_plan(chat_id)
-    if plan == PLAN_PREMIUM:
-        return True, ""
-    if plan == PLAN_STANDARD:
-        used = get_img_month(chat_id)
-        if used >= STANDARD_IMG_MONTHLY:
-            return False, f"Лимит картинок исчерпан ({STANDARD_IMG_MONTHLY}/мес). Обнови тариф или жди нового месяца."
-        return True, ""
-    used = get_usage(chat_id)
-    if used >= FREE_DAILY_LIMIT:
-        return False, f"Бесплатный лимит {FREE_DAILY_LIMIT}/сутки исчерпан. Выбери тариф в “{BTN_PRIC}”."
-    return True, ""
+async def cmd_history(update, context):
+    rows=last_history(update.effective_chat.id, 5)
+    if not rows: await update.message.reply_text("История пуста.", reply_markup=KB); return
+    text="Последние запросы:\n"+"\n".join(_gen_hist_line(*r) for r in rows)
+    await update.message.reply_text(text, reply_markup=KB)
 
-# ——— Кнопочные экраны ———
-async def show_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sids = list_sessions(chat_id, limit=10)
-    if not sids:
-        await update.message.reply_text("Диалогов пока нет. Нажми “🆕 Новый диалог”.", reply_markup=KB)
-        return
-    buttons = [[InlineKeyboardButton(title[:50], callback_data=f"sess:{sid}")] for sid, title, _ in sids]
-    await update.message.reply_text("Выбери диалог:", reply_markup=InlineKeyboardMarkup(buttons))
+async def cmd_voiceon(update, context): set_voice_reply(update.effective_chat.id, True);  await update.message.reply_text("Голосовой ответ: ВКЛ ✅", reply_markup=KB)
+async def cmd_voiceoff(update, context): set_voice_reply(update.effective_chat.id, False); await update.message.reply_text("Голосовой ответ: ВЫКЛ ✅", reply_markup=KB)
 
+# Админ: выдача/снятие/коды
+def _is_admin(update): return ADMIN_ID and str(update.effective_user.id)==str(ADMIN_ID)
+
+async def cmd_grant(update, context):
+    if not _is_admin(update): await update.message.reply_text("Недостаточно прав."); return
+    # /grant plan days
+    args=(update.message.text or "").split()
+    if len(args)!=3 or args[1] not in (PLAN_STANDARD,PLAN_PREMIUM):
+        await update.message.reply_text("Использование: /grant standard|premium <дней>"); return
+    set_plan(update.effective_chat.id, args[1], int(args[2])); await update.message.reply_text("Тариф выдан ✅")
+
+import secrets, string
+def _gen_code(n=15):
+    alphabet=string.ascii_uppercase+string.digits
+    return "-".join("".join(secrets.choice(alphabet) for _ in range(5)) for __ in range(3))[:n+(n-1)//5]
+
+def _create_codes(plan:str, days:int, count:int=1):
+    codes=[]
+    for _ in range(count):
+        c=_gen_code(15)
+        DBI.exec("INSERT INTO redeem_codes(code,plan,days,used) VALUES(?,?,?,0)", (c,plan,days))
+        codes.append(c)
+    return codes
+
+def _redeem(chat_id:int, code:str)->Tuple[bool,str]:
+    row=DBI.one("SELECT plan,days,used FROM redeem_codes WHERE code=?", (code,))
+    if not row: return False,"Код не найден."
+    plan,days,used=row
+    if used: return False,"Код уже использован."
+    set_plan(chat_id, plan, int(days or 30))
+    DBI.exec("UPDATE redeem_codes SET used=1 WHERE code=?", (code,))
+    return True,f"Тариф активирован: {plan} на {days} дн."
+
+async def cmd_genredeem(update, context):
+    if not _is_admin(update): await update.message.reply_text("Недостаточно прав."); return
+    # /genredeem standard 30 [count]
+    args=(update.message.text or "").split()
+    if len(args)<3 or args[1] not in (PLAN_STANDARD,PLAN_PREMIUM):
+        await update.message.reply_text("Использование: /genredeem standard|premium <дней> [кол-во]"); return
+    days=int(args[2]); count=int(args[3]) if len(args)>=4 else 1
+    codes=_create_codes(args[1], days, count)
+    await update.message.reply_text("Коды:\n"+"\n".join("- "+c for c in codes))
+
+async def cmd_redeem(update, context):
+    args=(update.message.text or "").split()
+    if len(args)<2:
+        await update.message.reply_text("Использование: /redeem КОД"); return
+    ok,msg=_redeem(update.effective_chat.id, args[1].strip().upper())
+    await update.message.reply_text(("✅ "+msg) if ok else ("❌ "+msg), reply_markup=KB)
+
+async def cmd_revoke(update, context):
+    if not _is_admin(update): await update.message.reply_text("Недостаточно прав."); return
+    args=(update.message.text or "").split()
+    if len(args)!=2 or not args[1].isdigit():
+        await update.message.reply_text("Использование: /revoke <telegram_user_id>"); return
+    uid=int(args[1])
+    DBI.exec("INSERT INTO plans(chat_id,plan,expires_at) VALUES(?,?,NULL) "
+             "ON CONFLICT(chat_id) DO UPDATE SET plan='free', expires_at=NULL", (uid,"free"))
+    await update.message.reply_text(f"Снята подписка у {uid} → free")
+
+# Inline callbacks — НИКОГДА НЕ АКТИВИРУЮТ тариф
 async def on_callback(update, context):
-    q = update.callback_query
+    q=update.callback_query
     await q.answer()
-    data = q.data or ""
-    if data.startswith("sess:"):
-        sid = int(data.split(":",1)[1])
-        set_current_session(update.effective_chat.id, sid)
-        reset_usage(update.effective_chat.id)
-        await q.edit_message_text("Диалог переключён ✅")
-        return
-    elif data.startswith("buy:"):
+    data=q.data or ""
+    if data.startswith("buy:"):
         await q.edit_message_text(
-            "Оплата по кнопке не активирует доступ автоматически.
-"
+            "Оплата по кнопке не активирует доступ автоматически.\n"
             "После оплаты введи код: /redeem КОД"
-        )
-        return
-    else:
-        await q.edit_message_text("Ок ✅")
-        return
+        ); return
+    await q.edit_message_text("Ок ✅")
 
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    chat_id = update.effective_chat.id
-    ensure_session(chat_id)
-
-    if text == BTN_CHAT:
-        set_mode(chat_id, "chat"); await update.message.reply_text("Режим: болталка", reply_markup=KB); return
-    if text == BTN_IMG:
-        set_mode(chat_id, "image"); await update.message.reply_text("Режим: генерация фото\nНапиши описание, можно --size 1024x1792", reply_markup=KB); return
-    if text == BTN_NEW:
-        conn = _db()
-        conn.execute("INSERT INTO sessions(chat_id,title,created_at) VALUES(?,?,?)",
-                     (chat_id, _now_title(), time.time()))
-        new_sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute(
-            "INSERT INTO prefs(chat_id,mode,current_session_id) VALUES(?,?,?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET current_session_id=excluded.current_session_id",
-            (chat_id, get_mode(chat_id), new_sid)
-        )
-        reset_usage(chat_id)
-        conn.commit(); conn.close()
-        await update.message.reply_text("Создан новый диалог ✅", reply_markup=KB); return
-    if text == BTN_LIST:
-        await show_sessions(update, context); return
-    if text == BTN_DEL:
-        ok = delete_current_session(chat_id)
-        if ok:
-            reset_usage(chat_id)
-            await update.message.reply_text("Диалог удалён. Создан новый пустой ✅", reply_markup=KB)
-        else:
-            await update.message.reply_text("Не удалось удалить диалог.", reply_markup=KB)
-        return
-    if text == BTN_HELP:
-        await update.message.reply_text(HELP_TEXT, reply_markup=KB); return
-    if text == BTN_MENU:
-        await update.message.reply_text("Меню открыто.", reply_markup=KB); return
-    if text == BTN_PRIC:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Купить Стандарт (200₽/мес)", callback_data="buy:standard")],
-            [InlineKeyboardButton("Купить Премиум (500₽/мес)",  callback_data="buy:premium")]
+# Текстовые сообщения
+async def on_text(update, context):
+    text=(update.message.text or "").strip()
+    chat_id=update.effective_chat.id
+    if text==BTN_CHAT: await update.message.reply_text("Режим: болталка. Пиши вопрос."); return
+    if text==BTN_IMG:  await update.message.reply_text("Режим: генерация фото. Опиши идею картинки."); return
+    if text==BTN_VOICE: await update.message.reply_text("Отправь голосовое сообщение — я распознаю и отвечу. Для голосового ответа: /voiceon или /voiceoff."); return
+    if text==BTN_HIST: await cmd_history(update, context); return
+    if text==BTN_TARIFF:
+        kb=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Купить Стандарт (200₽/мес)", url=PAYMENT_URL_STANDARD)],
+            [InlineKeyboardButton("Купить Премиум (500₽/мес)",  url=PAYMENT_URL_PREMIUM )]
         ])
         await update.message.reply_text(PRICING_TEXT, reply_markup=kb); return
-    if text == BTN_STAT:
-        await update.message.reply_text(_status_text(chat_id), reply_markup=KB); return
-    if text == BTN_PRIV:
-        await update.message.reply_text(PRIVACY_TEXT, reply_markup=KB); return
-    if text == BTN_WIPE:
-        delete_all_user_data(chat_id)
-        await update.message.reply_text("Все твои данные в боте удалены. Начинаем с чистого листа ✨", reply_markup=KB)
-        return
+    if text==BTN_HELP: await cmd_help(update, context); return
 
-    mode = get_mode(chat_id)
-    if mode == "image":
-        await handle_image_generation(update, context, text)
-    else:
-        await handle_chat(update, context, text)
+    # Авто-режим: сам решает — текст или картинка
+    if get_auto_mode(chat_id):
+        if detect_intent(text)=="image":
+            await handle_image(update, context, text); return
+        else:
+            await handle_chat(update, context, text); return
+    # по умолчанию — текст
+    await handle_chat(update, context, text)
 
-def _status_text(chat_id: int) -> str:
-    plan, exp = get_plan(chat_id)
-    used_today = get_usage(chat_id)
-    img_m = get_img_month(chat_id)
-    parts = [f"Текущий план: {('Бесплатный' if plan==PLAN_FREE else ('Стандарт' if plan==PLAN_STANDARD else 'Премиум'))}"]
-    if plan in (PLAN_STANDARD, PLAN_PREMIUM) and exp:
-        dt = datetime.datetime.fromtimestamp(exp).strftime("%d.%m.%Y %H:%M")
-        parts.append(f"Активен до: {dt}")
-    if plan == PLAN_FREE:
-        parts.append(f"Сегодня использовано: {used_today}/{FREE_DAILY_LIMIT}")
-    if plan == PLAN_STANDARD:
-        parts.append(f"Картинки в этом месяце: {img_m}/{STANDARD_IMG_MONTHLY}")
-    return "\n".join(parts)
-
-# ——— Chat (text) ———
-async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str):
-    chat_id = update.effective_chat.id
-    sid, _ = get_current_session(chat_id)
-    ok, warn = _allow_text(chat_id)
-    if not ok:
-        await update.message.reply_text(warn, reply_markup=KB); return
+# Фото от пользователя (анализ, краткий ответ)
+async def on_photo(update, context):
+    chat_id=update.effective_chat.id
+    ok,warn=allow_text(chat_id)
+    if not ok: await update.message.reply_text(warn, reply_markup=KB); return
     try:
-        client = _client()
         await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+        ph=update.message.photo[-1]
+        tg_file = await context.bot.get_file(ph.file_id)
+        buf = BytesIO(); await tg_file.download_to_memory(out=buf); img_bytes=buf.getvalue()
+        b64 = base64.b64encode(img_bytes).decode("ascii")
 
-        history = load_history(chat_id, sid, limit=20)
-        messages = [{"role": "system", "content": SYSTEM}]
-        for role, content in history:
-            messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": user_text})
-
-        for model in TEXT_PREFS:  # gpt‑5 в приоритете
+        msgs=[{
+            "role":"user",
+            "content":[
+                {"type":"text","text":"Опиши это изображение кратко и по делу."},
+                {"type":"image_url","image_url":{"url":f"data:image/jpeg;base64,{b64}"}}
+            ]
+        }]
+        client=_client()
+        out=None
+        for model in ["gpt-4o","gpt-4.1","gpt-4o-mini"]:
             try:
-                resp = client.chat.completions.create(model=model, messages=messages, temperature=0.5)
-                out = resp.choices[0].message.content.strip()
-                save_msg(chat_id, sid, "user", user_text)
-                save_msg(chat_id, sid, "assistant", out)
-                plan, _ = get_plan(chat_id)
-                if plan == PLAN_FREE:
-                    inc_usage(chat_id)
-                await update.message.reply_text(out, reply_markup=KB)
-                return
-            except (BadRequestError, APIStatusError, Exception):
+                r=client.chat.completions.create(model=model, messages=msgs, temperature=0.2)
+                out=(r.choices[0].message.content or "").strip()
+                if out: break
+            except Exception:
                 continue
-        await update.message.reply_text("Не удалось ответить ни одной моделью.", reply_markup=KB)
+        if not out:
+            await update.message.reply_text("Не удалось проанализировать фото.", reply_markup=KB); return
+        if get_plan(chat_id)[0]==PLAN_FREE: inc_text_usage(chat_id)
+        add_history(chat_id,"text","[photo]",out)
+        await update.message.reply_text(out, reply_markup=KB)
     except Exception as e:
-        tb = traceback.format_exc(limit=2)
-        await update.message.reply_text(f"Не удалось ответить: {e}\n{tb}", reply_markup=KB)
+        tb=traceback.format_exc(limit=2)
+        await update.message.reply_text(f"Ошибка анализа фото: {e}\n{tb}", reply_markup=KB)
 
-# ——— Image generation ———
-async def handle_image_generation(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    chat_id = update.effective_chat.id
-    sid, _ = get_current_session(chat_id)
-    ok, warn = _allow_image(chat_id)
-    if not ok:
-        await update.message.reply_text(warn, reply_markup=KB); return
-    try:
-        client = _client()
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
-
-        prompt, size = _parse_size_flag(text)
-
-        # 1) DALL·E 3
-        try:
-            gen = client.images.generate(model=IMAGE_PRIMARY, prompt=prompt, size=size)
-            if hasattr(gen.data[0], "url") and gen.data[0].url:
-                await update.message.reply_photo(photo=gen.data[0].url, caption=f"Готово ✅ ({size})", reply_markup=KB)
-                save_msg(chat_id, sid, "user", f"[imagine] {prompt} ({size})")
-                save_msg(chat_id, sid, "assistant", "[image]")
-                _post_image_count(chat_id)
-                return
-            b64 = getattr(gen.data[0], "b64_json", None)
-            if b64:
-                img_bytes = base64.b64decode(b64)
-                await update.message.reply_photo(photo=BytesIO(img_bytes), caption=f"Готово ✅ ({size})", reply_markup=KB)
-                save_msg(chat_id, sid, "user", f"[imagine] {prompt} ({size})")
-                save_msg(chat_id, sid, "assistant", "[image]")
-                _post_image_count(chat_id)
-                return
-        except PermissionDeniedError:
-            pass
-        except BadRequestError:
-            pass
-
-        # 2) gpt-image-1 (если доступ появится)
-        try:
-            gen2 = client.images.generate(model=IMAGE_FALLBACK, prompt=prompt, size=size, quality="high")
-            b64 = getattr(gen2.data[0], "b64_json", None)
-            if b64:
-                img_bytes = base64.b64decode(b64)
-                await update.message.reply_photo(photo=BytesIO(img_bytes), caption=f"Готово ✅ ({size})", reply_markup=KB)
-                save_msg(chat_id, sid, "user", f"[imagine] {prompt} ({size})")
-                save_msg(chat_id, sid, "assistant", "[image]")
-                _post_image_count(chat_id)
-                return
-            if hasattr(gen2.data[0], "url") and gen2.data[0].url:
-                await update.message.reply_photo(photo=gen2.data[0].url, caption=f"Готово ✅ ({size})", reply_markup=KB)
-                save_msg(chat_id, sid, "user", f"[imagine] {prompt} ({size})")
-                save_msg(chat_id, sid, "assistant", "[image]")
-                _post_image_count(chat_id)
-                return
-        except (PermissionDeniedError, BadRequestError):
-            pass
-
-        await update.message.reply_text("Не удалось получить картинку. Попробуй другой запрос или размер.", reply_markup=KB)
-    except Exception as e:
-        tb = traceback.format_exc(limit=2)
-        await update.message.reply_text(f"Ошибка генерации: {e}\n{tb}", reply_markup=KB)
-
-def _post_image_count(chat_id: int):
-    plan, _ = get_plan(chat_id)
-    if plan == PLAN_FREE:
-        inc_usage(chat_id)
-    elif plan == PLAN_STANDARD:
-        inc_img_month(chat_id)
-
-# ——— Vision (анализ фото) ———
-async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    sid, _ = get_current_session(chat_id)
-    ok, warn = _allow_text(chat_id)
-    if not ok:
-        await update.message.reply_text(warn, reply_markup=KB); return
-    try:
-        client = _client()
-        await context.bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
-
-        photo = update.message.photo[-1]
-        tg_file = await context.bot.get_file(photo.file_id)
-        buf = BytesIO()
-        await tg_file.download_to_memory(out=buf)
-        data_bytes = buf.getvalue()
-
-        b64 = base64.b64encode(data_bytes).decode("utf-8")
-        data_url = f"data:image/jpeg;base64,{b64}"
-        caption = (update.message.caption or "Опиши изображение").strip()
-
-        for model in VISION_PREFS:
-            try:
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role":"system","content":SYSTEM},
-                        {"role":"user","content":[
-                            {"type":"text","text":caption},
-                            {"type":"image_url","image_url":{"url":data_url}}
-                        ]}
-                    ],
-                    temperature=0.2
-                )
-                out = resp.choices[0].message.content.strip()
-                save_msg(chat_id, sid, "user", f"[image] {caption}")
-                save_msg(chat_id, sid, "assistant", out)
-                plan, _ = get_plan(chat_id)
-                if plan == PLAN_FREE:
-                    inc_usage(chat_id)
-                await update.message.reply_text(out, reply_markup=KB)
-                return
-            except (BadRequestError, APIStatusError, Exception):
-                continue
-        await update.message.reply_text("Не удалось проанализировать изображение.", reply_markup=KB)
-    except Exception as e:
-        tb = traceback.format_exc(limit=2)
-        await update.message.reply_text(f"Ошибка анализа изображения: {e}\n{tb}", reply_markup=KB)
-
-# ——— UI/команды и роутинг ———
 def build_application():
-    if not TG_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
-    app = ApplicationBuilder().token(TG_TOKEN).build()
+    app=ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("menu",    cmd_menu))
-    app.add_handler(CommandHandler("reset",   cmd_reset))
-    app.add_handler(CommandHandler("rename",  cmd_rename))
-    app.add_handler(CommandHandler("export",  cmd_export))
-    app.add_handler(CommandHandler("privacy", cmd_privacy))
-    app.add_handler(CommandHandler("wipe",    cmd_wipe))
     app.add_handler(CommandHandler("buy",     cmd_buy))
-    app.add_handler(CommandHandler("grant",   cmd_grant))  # админ
+    app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("voiceon", cmd_voiceon))
+    app.add_handler(CommandHandler("voiceoff",cmd_voiceoff))
+    # админ
+    app.add_handler(CommandHandler("grant",   cmd_grant))
+    app.add_handler(CommandHandler("genredeem", cmd_genredeem))
+    app.add_handler(CommandHandler("redeem",  cmd_redeem))
+    app.add_handler(CommandHandler("revoke",  cmd_revoke))
+    # кнопки/сообщения
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     return app
-
-# --- robust size parser (sizes/ratio/keywords RU+EN) ---
-import re as _re
-def _parse_size_flag(text: str, default: str = "1024x1024"):
-    """
-    Возвращает (prompt, size).
-    Понимает:
-      • --size 1024x1792 | size=16:9 | размер 9:16 | 1024 x 1024 | 1024
-      • слова: квадрат/square, портрет/vertical/portrait, альбом/landscape/горизонт
-    Подбирает допустимый размер под текущую модель генерации.
-    """
-    raw = text or ""
-    low = raw.lower()
-
-    # Допустимые размеры по модели
-    primary = (os.getenv("OPENAI_IMAGE_PRIMARY") or "dall-e-3").lower().strip()
-    if primary == "dall-e-3":
-        allowed = {"1024x1024", "1024x1792", "1792x1024"}
-        tall, wide, square = "1024x1792", "1792x1024", "1024x1024"
-    else:
-        # gpt-image-1 (или что-то ещё) — подберём ближайшее
-        allowed = {"1024x1024", "1024x1536", "1536x1024", "auto"}
-        tall, wide, square = "1024x1536", "1536x1024", "1024x1024"
-
-    def clamp_allowed(sz: str) -> str:
-        sz = sz.lower().replace(" ", "")
-        # Нормализация 1024×1536 и т.п.
-        sz = sz.replace("×", "x").replace("*", "x")
-        if sz in allowed:
-            return sz
-        # Пытаемся понять ориентацию/соотношение
-        m = _re.match(r"^(\d+)\s*x\s*(\d+)$", sz)
-        if m:
-            w, h = int(m.group(1)), int(m.group(2))
-            if w == h:   return square
-            if h > w:    return tall
-            return wide
-        # ratio a:b
-        m = _re.match(r"^(\d+)\s*:\s*(\d+)$", sz)
-        if m:
-            a, b = int(m.group(1)), int(m.group(2))
-            if a == b:   return square
-            if b > a:    return tall
-            return wide
-        # одно число — считаем квадрат
-        m = _re.match(r"^\d{3,4}$", sz)
-        if m:
-            return square
-        return default if default in allowed else square
-
-    # 1) Явные директивы: --size … | size=… | размер …
-    found_snippets = []
-    patterns = [
-        r"--size\s*([0-9x×:* ]+)",
-        r"\bsize\s*[=:]\s*([0-9x×:* ]+)",
-        r"\bразмер\s*[=:]?\s*([0-9x×:* ]+)",
-        r"\bratio\s*[=:]\s*([0-9: ]+)",
-        r"\bсоотношение\s*[=:]?\s*([0-9: ]+)",
-    ]
-    desired = None
-    for p in patterns:
-        m = _re.search(p, low)
-        if m:
-            desired = m.group(1).strip()
-            # сохраним весь фрагмент для вырезания из промпта
-            span = m.span()
-            found_snippets.append(raw[span[0]:span[1]])
-            break
-
-    # 2) Если не нашли директив, ищем свободные формы: 1024x1792 / 16:9 / 1024 x 1024
-    if not desired:
-        m = _re.search(r"\b(\d{3,4})\s*[x×*]\s*(\d{3,4})\b", low)
-        if m:
-            desired = f"{m.group(1)}x{m.group(2)}"
-            found_snippets.append(m.group(0))
-    if not desired:
-        m = _re.search(r"\b(\d{1,2})\s*:\s*(\d{1,2})\b", low)
-        if m:
-            desired = f"{m.group(1)}:{m.group(2)}"
-            found_snippets.append(m.group(0))
-    if not desired:
-        # одно число 512 / 768 / 1024
-        m = _re.search(r"\b(512|768|1024|1536|1792)\b", low)
-        if m:
-            desired = m.group(1)
-            found_snippets.append(m.group(0))
-
-    # 3) Ключевые слова ориентации
-    if not desired:
-        # рус/англ
-        if any(k in low for k in ["портрет", "вертик"] + ["portrait", "vertical"]):
-            desired = "portrait"
-        elif any(k in low for k in ["альбом", "горизонт"] + ["landscape", "horizontal"]):
-            desired = "landscape"
-        elif any(k in low for k in ["квадрат", "square"]):
-            desired = "square"
-
-    # 4) Нормализация желаемого и выбор допустимого
-    chosen = None
-    if desired:
-        d = desired.lower().strip()
-        d = d.replace("×", "x").replace("*", "x")
-        if d in ("portrait", "vertical"):
-            chosen = tall
-        elif d in ("landscape", "horizontal"):
-            chosen = wide
-        elif d in ("square", "квадрат"):
-            chosen = square
-        elif _re.match(r"^\d+\s*:\s*\d+$", d):
-            chosen = clamp_allowed(d)
-        elif _re.match(r"^\d{3,4}\s*x\s*\d{3,4}$", d):
-            chosen = clamp_allowed(d)
-        elif _re.match(r"^\d{3,4}$", d):
-            chosen = clamp_allowed(d)
-        else:
-            chosen = default if default in allowed else square
-    else:
-        chosen = default if default in allowed else square
-
-    # 5) Чистим промпт от директив и ключевых слов (аккуратно)
-    cleaned = raw
-    for snip in found_snippets:
-        cleaned = cleaned.replace(snip, "")
-    # удалим возможные маркеры без значений
-    cleaned = _re.sub(r"--size\s*[0-9x×:* ]*", "", cleaned, flags=_re.IGNORECASE)
-    cleaned = _re.sub(r"\b(size|размер|ratio|соотношение)\s*[=:]?\s*[0-9x×:* ]*", "", cleaned, flags=_re.IGNORECASE)
-    # уберём одиночные слова-режимы, если они шли как маркеры
-    cleaned = _re.sub(r"\b(портрет(ная)?|вертик(альный|альная)?|portrait|vertical)\b", "", cleaned, flags=_re.IGNORECASE)
-    cleaned = _re.sub(r"\b(альбом(ная)?|горизонт(альный|альная)?|landscape|horizontal)\b", "", cleaned, flags=_re.IGNORECASE)
-    cleaned = _re.sub(r"\b(квадрат(ный)?|square)\b", "", cleaned, flags=_re.IGNORECASE)
-
-    cleaned = _re.sub(r"\s{2,}", " ", cleaned).strip()
-
-    return cleaned or raw.strip(), chosen
-# --- end robust size parser ---
-
-
-def detect_intent(text:str)->str:
-    t = (text or "").lower()
-    gen_markers = [
-        # RU
-        "сгенерируй","создай картинку","создай изображение","сделай картинку",
-        "сделай изображение","нарисуй","изобрази","сгенери","генерация",
-        "картинку","картинка","изображение","постер","логотип","логитип",
-        "афишу","обложку","арт","иллюстрацию","концепт-арт","концепт арт",
-        "баннер","визуал","дизайн","иконку","эмблему",
-        # EN
-        "make an image","generate an image","create an image","draw",
-        "render","make a poster","logo","poster","artwork","illustration",
-        "concept art","image of","picture of",
-        # hints
-        "--size"," ratio ","размер ","16:9","9:16","1024x","x1024","1792x1024","1024x1792"
-    ]
-    if any(k in t for k in gen_markers):
-        return "image"
-    return "chat"
-
