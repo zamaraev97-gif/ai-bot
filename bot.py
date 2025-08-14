@@ -260,7 +260,10 @@ async def handle_chat(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str
     if get_voice_reply(chat_id):
         try:
             path = await synth_tts(out, chat_id)
-            await context.bot.send_audio(chat_id, audio=InputFile(path, filename="reply.mp3"))
+            if path.endswith(".ogg"):
+                await context.bot.send_voice(chat_id, voice=InputFile(path, filename="reply.ogg"))
+            else:
+                await context.bot.send_audio(chat_id, audio=InputFile(path, filename="reply.mp3"))
         except Exception:
             pass
 
@@ -371,19 +374,35 @@ async def on_voice(update:Update, context:ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка распознавания: {e}\n{tb}", reply_markup=KB)
 
 async def synth_tts(text:str, chat_id:int)->str:
+    """Пытается сгенерить речь в OGG/Opus (для send_voice). Фоллбэк — MP3."""
     t=text.strip()
     if len(t)>800: t=t[:800]
-    path=f"/tmp/tts_{chat_id}.mp3"
     client=_client()
+
+    # 1) Пытаемся получить opus/ogg (идеально для Telegram voice)
     for m in ("gpt-4o-mini-tts","tts-1"):
         try:
+            path=f"/tmp/tts_{chat_id}.ogg"
             with client.audio.speech.with_streaming_response.create(
-                model=m, voice=OPENAI_TTS_VOICE, input=t
+                model=m, voice=OPENAI_TTS_VOICE, input=t, response_format="opus"
             ) as resp:
                 resp.stream_to_file(path)
             return path
         except Exception:
             continue
+
+    # 2) Фоллбэк — MP3
+    for m in ("gpt-4o-mini-tts","tts-1"):
+        try:
+            path=f"/tmp/tts_{chat_id}.mp3"
+            with client.audio.speech.with_streaming_response.create(
+                model=m, voice=OPENAI_TTS_VOICE, input=t, response_format="mp3"
+            ) as resp:
+                resp.stream_to_file(path)
+            return path
+        except Exception:
+            continue
+
     raise RuntimeError("TTS unavailable")
 
 # ========= Commands / Buttons =========
