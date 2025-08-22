@@ -260,6 +260,8 @@ async def handle_chat(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str
 
     if get_voice_reply(chat_id):
         try:
+            await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
+            print("[TTS] voice reply enabled, synthesizing…")
             path = await synth_tts(out, chat_id)
             if path.endswith(".ogg"):
                 await context.bot.send_voice(chat_id, voice=InputFile(path, filename="reply.ogg"))
@@ -398,6 +400,7 @@ async def synth_tts(text:str, chat_id:int)->str:
         except Exception as e:
             last_err = e
             continue
+    print(f"[TTS-ERR] TTS unavailable: {last_err}")
     raise RuntimeError(f"TTS unavailable: {last_err}")
 # ========= Commands / Buttons =========
 async def cmd_start(update, context): await update.message.reply_text("Выбери действие 👇", reply_markup=KB)
@@ -567,8 +570,10 @@ def build_application():
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("buy",     cmd_buy))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("voicesettings", cmd_voicesettings))
     app.add_handler(CommandHandler("voiceon", cmd_voiceon))
     app.add_handler(CommandHandler("voiceoff",cmd_voiceoff))
+    app.add_handler(CommandHandler("voicetest", cmd_voicetest))
     # админ
     app.add_handler(CommandHandler("grant",   cmd_grant))
     app.add_handler(CommandHandler("genredeem", cmd_genredeem))
@@ -588,10 +593,25 @@ def build_application():
 
 
 def _has_ffmpeg()->bool:
-    return bool(which("ffmpeg"))
+    ok = bool(which("ffmpeg"))
+    print(f"[TTS] ffmpeg={'yes' if ok else 'no'}")
+    return ok
 
 def _mp3_to_ogg_opus(mp3_path:str, ogg_path:str)->bool:
     if not _has_ffmpeg():
+        print("[TTS] ffmpeg not found, keep MP3")
+        return False
+    cmd = [
+        "ffmpeg", "-y", "-i", mp3_path,
+        "-c:a", "libopus", "-b:a", "48k", "-vbr", "on",
+        ogg_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[TTS] converted MP3 -> OGG: {ogg_path}")
+        return True
+    except Exception as e:
+        print(f"[TTS-ERR] ffmpeg convert failed: {e}")
         return False
     cmd = [
         "ffmpeg", "-y", "-i", mp3_path,
@@ -603,3 +623,26 @@ def _mp3_to_ogg_opus(mp3_path:str, ogg_path:str)->bool:
         return True
     except Exception:
         return False
+
+
+async def cmd_voicesettings(update, context):
+    chat_id = update.effective_chat.id
+    plan,_ = get_plan(chat_id)
+    await update.message.reply_text(
+        f"Голосовой ответ: {'ВКЛ' if get_voice_reply(chat_id) else 'ВЫКЛ'}\nПлан: {plan}",
+        reply_markup=KB
+    )
+
+
+async def cmd_voicetest(update, context):
+    chat_id = update.effective_chat.id
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.RECORD_VOICE)
+        path = await synth_tts("Это тест голосового ответа. One two three.", chat_id)
+        if path.endswith(".ogg"):
+            await context.bot.send_voice(chat_id, voice=InputFile(path, filename="test.ogg"))
+        else:
+            await context.bot.send_audio(chat_id, audio=InputFile(path, filename="test.mp3"))
+        await update.message.reply_text("Готово: голос отправлен ✅", reply_markup=KB)
+    except Exception as e:
+        await update.message.reply_text(f"❌ TTS не сработал: {e}", reply_markup=KB)
