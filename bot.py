@@ -264,9 +264,11 @@ async def handle_chat(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str
             print("[TTS] voice reply enabled, synthesizing…")
             path = await synth_tts(out, chat_id)
             if path.endswith(".ogg"):
-                await context.bot.send_voice(chat_id, voice=InputFile(path, filename="reply.ogg"), duration=_probe_duration(path) or None)
+                print(f"[TTS] send_voice reply: {path} ({_filesize(path)} bytes), dur={_probe_duration(path)}")
+            await context.bot.send_voice(chat_id, voice=InputFile(path, filename="reply.ogg"), duration=_probe_duration(path) or None)
             else:
-                await context.bot.send_audio(chat_id, audio=InputFile(path, filename="reply.mp3"))
+                print(f"[TTS] send_audio reply: {path} ({_filesize(path)} bytes)")
+            await context.bot.send_audio(chat_id, audio=InputFile(path, filename="reply.mp3"))
         except Exception as e:
             print(f"[TTS-ERR] {type(e).__name__}: {e}")
 
@@ -407,13 +409,15 @@ async def synth_tts(text:str, chat_id:int)->str:
             if _mp3_to_ogg_opus(mp3_path, ogg_path):
                 ogg_size = os.path.getsize(ogg_path) if os.path.exists(ogg_path) else 0
                 if ogg_size >= 2000:
-                    return ogg_path
+                    print(f"[TTS] return ogg: {ogg_path} ({_filesize(ogg_path)} bytes)")
+            return ogg_path
                 else:
                     print("[TTS-ERR] ogg too small, fallback to mp3")
 
             # фоллбэк — отправим mp3, если он нормальный
             if mp3_size >= 2000:
-                return mp3_path
+                print(f"[TTS] return mp3: {mp3_path} ({_filesize(mp3_path)} bytes)")
+            return mp3_path
 
         except Exception as e:
             last_err = e
@@ -698,9 +702,11 @@ async def cmd_voicetest(update, context):
         path = await synth_tts("Это тест голосового ответа. One two three.", chat_id)
         size = os.path.getsize(path) if os.path.exists(path) else 0
         if path.endswith(".ogg"):
-            await context.bot.send_voice(chat_id, voice=InputFile(path, filename="test.ogg"), duration=_probe_duration(path) or None)
+            print(f"[TTS] send_voice test: {path} ({_filesize(path)} bytes), dur={_probe_duration(path)}")
+        await context.bot.send_voice(chat_id, voice=InputFile(path, filename="test.ogg"), duration=_probe_duration(path) or None)
         else:
-            await context.bot.send_audio(chat_id, audio=InputFile(path, filename="test.mp3"))
+            print(f"[TTS] send_audio test: {path} ({_filesize(path)} bytes)")
+        await context.bot.send_audio(chat_id, audio=InputFile(path, filename="test.mp3"))
         await update.message.reply_text(f"Готово: голос отправлен ✅\nФайл: {path}\nРазмер: {size} байт", reply_markup=KB)
     except Exception as e:
         await update.message.reply_text(f"❌ TTS не сработал: {e}", reply_markup=KB)
@@ -722,4 +728,12 @@ def _probe_duration(path:str)->int:
         return max(0, int(round(d)))
     except Exception as e:
         print(f"[TTS] ffprobe fail: {e}")
+        return 0
+
+
+def _filesize(path:str)->int:
+    try:
+        import os
+        return os.path.getsize(path) if os.path.exists(path) else 0
+    except Exception:
         return 0
