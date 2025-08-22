@@ -264,7 +264,7 @@ async def handle_chat(update:Update, context:ContextTypes.DEFAULT_TYPE, text:str
             print("[TTS] voice reply enabled, synthesizing…")
             path = await synth_tts(out, chat_id)
             if path.endswith(".ogg"):
-                await context.bot.send_voice(chat_id, voice=InputFile(path, filename="reply.ogg"))
+                await context.bot.send_voice(chat_id, voice=InputFile(path, filename="reply.ogg"), duration=_probe_duration(path) or None)
             else:
                 await context.bot.send_audio(chat_id, audio=InputFile(path, filename="reply.mp3"))
         except Exception as e:
@@ -628,6 +628,31 @@ def _mp3_to_ogg_opus(mp3_path:str, ogg_path:str)->bool:
         "-ac", "1",           # mono
         "-ar", "48000",       # 48 kHz
         "-c:a", "libopus",
+        "-b:a", "64k",
+        "-vbr", "on",
+        "-compression_level", "10",
+        "-application", "voip",
+        "-map_metadata", "-1",
+        "-f", "ogg",          # ВАЖНО: контейнер OGG
+        ogg_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            print(f"[TTS] converted MP3 -> OGG (Opus): {ogg_path} ({os.path.getsize(ogg_path)} bytes)")
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        print(f"[TTS-ERR] ffmpeg convert failed: {e}")
+        return False
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", mp3_path,
+        "-vn",
+        "-ac", "1",           # mono
+        "-ar", "48000",       # 48 kHz
+        "-c:a", "libopus",
         "-b:a", "48k",
         "-vbr", "on",
         "-application", "voip",
@@ -673,9 +698,28 @@ async def cmd_voicetest(update, context):
         path = await synth_tts("Это тест голосового ответа. One two three.", chat_id)
         size = os.path.getsize(path) if os.path.exists(path) else 0
         if path.endswith(".ogg"):
-            await context.bot.send_voice(chat_id, voice=InputFile(path, filename="test.ogg"))
+            await context.bot.send_voice(chat_id, voice=InputFile(path, filename="test.ogg"), duration=_probe_duration(path) or None)
         else:
             await context.bot.send_audio(chat_id, audio=InputFile(path, filename="test.mp3"))
         await update.message.reply_text(f"Готово: голос отправлен ✅\nФайл: {path}\nРазмер: {size} байт", reply_markup=KB)
     except Exception as e:
         await update.message.reply_text(f"❌ TTS не сработал: {e}", reply_markup=KB)
+
+
+def _probe_duration(path:str)->int:
+    "Возвращает округлённую длительность секундами, если установлен ffprobe."
+    try:
+        import shutil, json, subprocess
+        if not shutil.which("ffprobe"):
+            return 0
+        out = subprocess.check_output([
+            "ffprobe","-v","error","-show_entries","format=duration",
+            "-of","default=noprint_wrappers=1:nokey=1", path
+        ], stderr=subprocess.STDOUT, timeout=5).decode("utf-8", "ignore").strip()
+        d = float(out)
+        if d != d:  # NaN
+            return 0
+        return max(0, int(round(d)))
+    except Exception as e:
+        print(f"[TTS] ffprobe fail: {e}")
+        return 0
